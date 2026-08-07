@@ -106,12 +106,13 @@ PATH 中，因此多数情况**无需修改 PATH**）：
 - 冲突检测：同时检查 PATH 中是否已有同名 `.exe` / `.cmd`，有则提示优先解析到的位置
 - 兼容选中 `bin` 子目录：自动向上找到上级的主程序（如 `Code.exe`）
 - 支持参数透传：`vscode . -r`（复用窗口）、`vscode D:\some\file.txt`
+- 两类预设：**GUI 应用**（vscode，传目录参数）与**命令行工具**（codex，继承 cwd、不传目录参数、经 ShellExecute 启动 .cmd）
 
 ## 路线图
 
 - [x] VS Code 支持（首个应用）
+- [x] 预设应用模板（vscode、codex 内置；cursor/claude 待加）
 - [x] 图形界面管理：多目标列表、安装/更新、卸载、添加自定义、移除、刷新
-- [ ] 预设应用模板（Cursor、Claude、Codex、Windsurf……），免手动选目录
 - [ ] 无 gcc 环境默认分发预编译 launcher
 - [ ] 系统托盘常驻 / 开机自启动
 
