@@ -16,9 +16,10 @@ Codex……），安装后即可用一行命令以「当前文件夹」为参数
 ## 使用
 
 ### GUI 界面（推荐）
-双击 `openin.exe`（或无参数运行）打开**管理主窗口**：列表罗列可注入的应用
-（预设 + 自定义），选中后点「安装/更新」即可；还支持卸载、添加自定义、移除、刷新。
-自定义目标与安装状态持久化在 `%LOCALAPPDATA%\openin\targets.ini`。
+双击 `openin.exe`（或无参数运行）打开**管理主窗口**：每个应用一行（名称 + 路径框 + 浏览 + 安装）。
+窗口打开即**自动检索**并填入主程序路径，确认无误后点「安装」即可。
+- 底部「重新检测」重新扫描路径；「高级▾」菜单含卸载、添加自定义、打开配置目录
+- 自定义为非核心功能（经「高级▾ → 添加自定义…」录入），安装状态持久化在 `%LOCALAPPDATA%\openin\targets.ini`
 
 ### 命令行模式
 ```bat
@@ -42,7 +43,7 @@ openin.exe -q -d "D:\..."                   :: 静默模式，结果写入日志
 winget install BrechtSanders.WinLibs.POSIX.UCRT
 
 :: 编译
-gcc -O2 -s -municode -mwindows -o openin.exe openin.c -lshell32 -lole32
+gcc -O2 -s -municode -mwindows -o openin.exe openin.c -lshell32 -lole32 -lcomdlg32
 ```
 
 编译参数说明：
@@ -51,8 +52,9 @@ gcc -O2 -s -municode -mwindows -o openin.exe openin.c -lshell32 -lole32
 |---|---|
 | `-municode` | 使用 `wmain` 宽字符入口，正确处理中文 / Unicode 路径 |
 | `-mwindows` | GUI 子系统，运行时不弹出黑框 |
-| `-O2 -s` | 优化并去符号瘦身（产物约 34 KB） |
-| `-lshell32 -lole32` | 链接文件夹选择对话框与 COM 所需系统库 |
+| `-O2 -s` | 优化并去符号瘦身（产物约 51 KB） |
+| `-lshell32 -lole32` | 文件夹选择对话框与 COM 所需系统库 |
+| `-lcomdlg32` | 文件选择对话框（GetOpenFileName） |
 
 产物 `openin.exe` 是**单文件便携程序**，可拷到任何 Windows 机器直接双击运行，
 目标机器无需安装编译器。

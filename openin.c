@@ -25,7 +25,6 @@
 
 #include <windows.h>
 #include <shlobj.h>
-#include <commctrl.h>
 #include <commdlg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -940,25 +939,157 @@ static const Preset PRESETS[] = {
 };
 
 /* ---------- GUI ---------- */
+/* 自动检索: 轻量扫描常用根 + 盘符根,首个命中即停 */
+static BOOL search_tree(const wchar_t *root, const wchar_t *exeName,
+                        int depth, int maxDepth, wchar_t *out)
+{
+    wchar_t pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE hf;
+
+    if (out[0]) return TRUE;
+    if (depth > maxDepth) return FALSE;
+    _snwprintf_s(pat, MAX_PATH, MAX_PATH - 1, L"%s\\*", root);
+    hf = FindFirstFileW(pat, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (out[0]) break;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            wchar_t sub[MAX_PATH];
+            _snwprintf_s(sub, MAX_PATH, MAX_PATH - 1, L"%s\\%s", root, fd.cFileName);
+            search_tree(sub, exeName, depth + 1, maxDepth, out);
+        } else {
+            if (_wcsicmp(fd.cFileName, exeName) == 0)
+                _snwprintf_s(out, MAX_PATH, MAX_PATH - 1, L"%s\\%s", root, fd.cFileName);
+        }
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+    return out[0] != L'\0';
+}
+
+/* 盘符根一层: 枚举根下子目录,直接探测 exe,不深入 */
+static BOOL scan_root_shallow(const wchar_t *root, const wchar_t *exeName, wchar_t *out)
+{
+    wchar_t pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE hf;
+
+    _snwprintf_s(pat, MAX_PATH, MAX_PATH - 1, L"%s*", root);
+    hf = FindFirstFileW(pat, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            wchar_t cand[MAX_PATH];
+            _snwprintf_s(cand, MAX_PATH, MAX_PATH - 1, L"%s%s\\%s", root, fd.cFileName, exeName);
+            if (path_exists(cand)) {
+                wcscpy_s(out, MAX_PATH, cand);
+                FindClose(hf);
+                return TRUE;
+            }
+        }
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+    return FALSE;
+}
+
+/* 自动检索主程序完整路径;成功返回 TRUE */
+static BOOL detect_app(const wchar_t *exeName, wchar_t *out, size_t out_sz)
+{
+    wchar_t root[MAX_PATH], buf[MAX_PATH];
+    DWORD len, drives;
+    int i;
+
+    out[0] = L'\0';
+
+    /* 1. PATH 目录 */
+    len = GetEnvironmentVariableW(L"Path", NULL, 0);
+    if (len && len < 32768) {
+        wchar_t *path = (wchar_t *)malloc((len + 1) * sizeof(wchar_t));
+        if (path) {
+            const wchar_t *p;
+            GetEnvironmentVariableW(L"Path", path, len + 1);
+            p = path;
+            while (*p && !out[0]) {
+                const wchar_t *end = wcschr(p, L';');
+                size_t dlen = end ? (size_t)(end - p) : wcslen(p);
+                if (dlen < MAX_PATH) {
+                    memcpy(root, p, dlen * sizeof(wchar_t));
+                    root[dlen] = L'\0';
+                    _snwprintf_s(buf, MAX_PATH, MAX_PATH - 1, L"%s\\%s", root, exeName);
+                    if (path_exists(buf)) wcscpy_s(out, out_sz, buf);
+                }
+                if (!end) break;
+                p = end + 1;
+            }
+            free(path);
+        }
+    }
+    if (out[0]) return TRUE;
+
+    /* 2. Programs 常用根(深度 2) */
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", root, MAX_PATH)) {
+        _snwprintf_s(buf, MAX_PATH, MAX_PATH - 1, L"%s\\Programs", root);
+        search_tree(buf, exeName, 0, 2, out);
+    }
+    if (!out[0] && GetEnvironmentVariableW(L"ProgramFiles", root, MAX_PATH))
+        search_tree(root, exeName, 0, 2, out);
+    if (!out[0] && GetEnvironmentVariableW(L"ProgramFiles(x86)", root, MAX_PATH))
+        search_tree(root, exeName, 0, 2, out);
+
+    /* 3. 各固定盘根(一层) */
+    if (!out[0]) {
+        drives = GetLogicalDrives();
+        for (i = 0; i < 26; i++) {
+            if (drives & (1 << i)) {
+                wchar_t drv[4] = { (wchar_t)(L'A' + i), L':', L'\\', 0 };
+                if (GetDriveTypeW(drv) == DRIVE_FIXED && scan_root_shallow(drv, exeName, buf))
+                    wcscpy_s(out, out_sz, buf);
+            }
+        }
+    }
+    return out[0] != L'\0';
+}
+
 enum {
-    IDC_LIST = 100,
-    IDC_STATUS = 101,
-    IDC_BTN_INSTALL = 102,
-    IDC_BTN_UNINSTALL = 103,
-    IDC_BTN_ADD = 104,
-    IDC_BTN_REMOVE = 105,
-    IDC_BTN_REFRESH = 106,
-    IDC_BTN_CLOSE = 107,
+    IDC_REDETECT = 102,
+    IDC_ADV = 103,
+    IDC_STATUS = 104,
+    IDC_ROW_EDIT = 500,
+    IDC_ROW_BROWSE = 600,
+    IDC_ROW_INSTALL = 700,
+    IDC_ROW_REMOVE = 800,
+    IDM_ADD = 401,
+    IDM_UNINSTALL = 402,
+    IDM_CONFIG = 404,
+    IDM_ABOUT = 405,
     IDC_AD_NAME = 200,
     IDC_AD_PATH = 201,
     IDC_AD_BROWSE = 202
 };
 
-static HWND g_hList, g_hStatus;
+static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hStatus;
+static HWND *g_name, *g_edit, *g_browse, *g_install, *g_remove, *g_rowStatus;
+static int g_rowCount = 0;
+static int g_activeRow = -1;
 static const wchar_t *g_winClass = L"openin_main";
 static int g_addResult = 0;
 
 static int preset_count(void) { return (int)(sizeof(PRESETS) / sizeof(PRESETS[0])); }
+
+/* 目标总数 = 预设 + 非预设自定义 */
+static int total_rows(void)
+{
+    int n = preset_count();
+    for (int i = 0; i < g_targetCount; i++) {
+        int isP = 0;
+        for (int p = 0; p < preset_count(); p++)
+            if (_wcsicmp(PRESETS[p].name, g_targets[i].name) == 0) { isP = 1; break; }
+        if (!isP) n++;
+    }
+    return n;
+}
 
 /* g_targets 中第 k 个「非预设」项的索引 */
 static int non_preset_index(int k)
@@ -993,202 +1124,283 @@ static int row_to_name(int row, wchar_t *name, size_t sz)
     return 0;
 }
 
+/* 行 → 主程序文件名(预设);自定义返回 NULL */
+static const wchar_t *row_exe_name(int row)
+{
+    if (row < preset_count()) return PRESETS[row].exeName;
+    return NULL;
+}
+
+/* 该命令的 launcher 文件是否已安装 */
+static BOOL is_installed(const wchar_t *name)
+{
+    wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH];
+    if (!g_installDir[0]) return FALSE;
+    _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", g_installDir, name);
+    _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", g_installDir, name);
+    return path_exists(exePath) || path_exists(cmdPath);
+}
+
 /* 计算某命令的安装状态 */
 static void target_status(const wchar_t *name, wchar_t *out, size_t sz)
 {
-    wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH];
-    BOOL present;
-
-    if (!g_installDir[0]) {
+    if (!is_installed(name)) {
         wcscpy_s(out, sz, L"未安装");
-        return;
-    }
-    _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", g_installDir, name);
-    _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", g_installDir, name);
-    present = path_exists(exePath) || path_exists(cmdPath);
-    if (present)
+    } else {
         wcscpy_s(out, sz, path_in_environment(g_installDir) ? L"已安装" : L"已安装(PATH 缺失)");
-    else
-        wcscpy_s(out, sz, L"未安装");
+    }
 }
 
-static void populate_list(void)
+static void destroy_rows(void)
 {
-    LVITEMW item;
-    int row = 0, i, p;
-
-    if (!g_hList) return;
-    ListView_DeleteAllItems(g_hList);
-
-    /* 预设行 */
-    for (i = 0; i < preset_count(); i++) {
-        wchar_t status[64];
-        ZeroMemory(&item, sizeof(item));
-        item.mask = LVIF_TEXT;
-        item.iItem = row;
-        item.iSubItem = 0;
-        item.pszText = (wchar_t *)PRESETS[i].display;
-        ListView_InsertItem(g_hList, &item);
-        ListView_SetItemText(g_hList, row, 1, (wchar_t *)PRESETS[i].name);
-        target_status(PRESETS[i].name, status, 64);
-        ListView_SetItemText(g_hList, row, 2, status);
-        ListView_SetItemText(g_hList, row, 3, (wchar_t *)PRESETS[i].exeName);
-        row++;
+    int i;
+    for (i = 0; i < g_rowCount; i++) {
+        if (g_name[i]) DestroyWindow(g_name[i]);
+        if (g_edit[i]) DestroyWindow(g_edit[i]);
+        if (g_browse[i]) DestroyWindow(g_browse[i]);
+        if (g_install[i]) DestroyWindow(g_install[i]);
+        if (g_remove[i]) DestroyWindow(g_remove[i]);
+        if (g_rowStatus[i]) DestroyWindow(g_rowStatus[i]);
     }
-    /* 自定义行(非预设的目标) */
-    for (i = 0; i < g_targetCount; i++) {
-        int isP = 0;
-        for (p = 0; p < preset_count(); p++)
-            if (_wcsicmp(PRESETS[p].name, g_targets[i].name) == 0) { isP = 1; break; }
-        if (isP) continue;
-        {
-            wchar_t status[64], disp[160];
-            ZeroMemory(&item, sizeof(item));
-            item.mask = LVIF_TEXT;
-            item.iItem = row;
-            item.iSubItem = 0;
-            _snwprintf_s(disp, 160, 159, L"%s (自定义)", g_targets[i].name);
-            item.pszText = disp;
-            ListView_InsertItem(g_hList, &item);
-            ListView_SetItemText(g_hList, row, 1, g_targets[i].name);
-            target_status(g_targets[i].name, status, 64);
-            ListView_SetItemText(g_hList, row, 2, status);
-            ListView_SetItemText(g_hList, row, 3, g_targets[i].exePath);
-            row++;
+    if (g_name) {
+        free(g_name); free(g_edit); free(g_browse);
+        free(g_install); free(g_remove); free(g_rowStatus);
+    }
+    g_name = g_edit = g_browse = g_install = g_remove = g_rowStatus = NULL;
+    g_rowCount = 0;
+}
+
+static void build_rows(HWND h)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    int n, i;
+
+    destroy_rows();
+    n = total_rows();
+    g_rowCount = n;
+    if (n <= 0) return;
+    g_name = (HWND *)calloc((size_t)n, sizeof(HWND));
+    g_edit = (HWND *)calloc((size_t)n, sizeof(HWND));
+    g_browse = (HWND *)calloc((size_t)n, sizeof(HWND));
+    g_install = (HWND *)calloc((size_t)n, sizeof(HWND));
+    g_remove = (HWND *)calloc((size_t)n, sizeof(HWND));
+    g_rowStatus = (HWND *)calloc((size_t)n, sizeof(HWND));
+    if (!g_name || !g_edit || !g_browse || !g_install || !g_remove || !g_rowStatus)
+        return;
+
+    for (i = 0; i < n; i++) {
+        wchar_t label[160];
+        if (i < preset_count()) {
+            _snwprintf_s(label, 160, 159, L"%s  (%s)", PRESETS[i].display, PRESETS[i].name);
+        } else {
+            wchar_t nm[64];
+            row_to_name(i, nm, 64);
+            _snwprintf_s(label, 160, 159, L"%s (自定义)", nm);
         }
+        g_name[i] = CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE,
+            0, 0, 120, 20, h, NULL, hi, NULL);
+        g_edit[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 100, 22, h,
+            (HMENU)(INT_PTR)(IDC_ROW_EDIT + i), hi, NULL);
+        g_browse[i] = CreateWindowExW(0, L"BUTTON", L"浏览",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 60, 24, h,
+            (HMENU)(INT_PTR)(IDC_ROW_BROWSE + i), hi, NULL);
+        g_install[i] = CreateWindowExW(0, L"BUTTON", L"安装",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 90, 26, h,
+            (HMENU)(INT_PTR)(IDC_ROW_INSTALL + i), hi, NULL);
+        if (i >= preset_count())   /* 自定义行带「移除」 */
+            g_remove[i] = CreateWindowExW(0, L"BUTTON", L"移除",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 50, 26, h,
+                (HMENU)(INT_PTR)(IDC_ROW_REMOVE + i), hi, NULL);
+        g_rowStatus[i] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+            0, 0, 200, 18, h, NULL, hi, NULL);
     }
+}
+
+/* 填充一行路径: 先取已记录路径,否则自动检索 */
+static void fill_path(int row)
+{
+    wchar_t name[64], found[MAX_PATH] = L"";
+    int tidx;
+
+    if (!row_to_name(row, name, 64)) return;
+    tidx = find_target(name);
+    if (tidx >= 0 && g_targets[tidx].exePath[0] && path_exists(g_targets[tidx].exePath))
+        wcscpy_s(found, MAX_PATH, g_targets[tidx].exePath);
+    if (!found[0] && row < preset_count())
+        detect_app(PRESETS[row].exeName, found, MAX_PATH);
+    SetWindowTextW(g_edit[row], found);
+}
+
+/* 刷新一行状态文本与安装按钮标签 */
+static void update_status(int row)
+{
+    wchar_t name[64], st[64];
+
+    if (!row_to_name(row, name, 64)) return;
+    target_status(name, st, 64);
+    SetWindowTextW(g_rowStatus[row], st);
+    SetWindowTextW(g_install[row], is_installed(name) ? L"更新" : L"安装");
 }
 
 static void layout_controls(HWND h)
 {
     RECT rc;
-    int m = 10, btnH = 28, statusH = 56;
-    int w, yBtn;
+    int m = 10, rowH = 62, top = 36;
+    int w, yBottom, i;
 
     GetClientRect(h, &rc);
     w = rc.right - rc.left;
-    yBtn = rc.bottom - m - btnH;
-    if (g_hList)
-        MoveWindow(g_hList, m, m, w - 2 * m, yBtn - m - statusH - m, TRUE);
-    if (g_hStatus)
-        MoveWindow(g_hStatus, m, yBtn - m - statusH, w - 2 * m, statusH, TRUE);
-    for (int i = 0; i < 6; i++) {
-        HWND btn = GetDlgItem(h, IDC_BTN_INSTALL + i);
-        if (btn) MoveWindow(btn, m + i * 108, yBtn, 100, btnH, TRUE);
+    yBottom = rc.bottom - m - 26;
+
+    if (g_hHeader)
+        MoveWindow(g_hHeader, m, 8, w - 2 * m, 20, TRUE);
+
+    for (i = 0; i < g_rowCount; i++) {
+        int y = top + i * rowH;
+        if (g_name[i]) MoveWindow(g_name[i], m, y + 2, 120, 20, TRUE);
+        if (g_edit[i]) MoveWindow(g_edit[i], 135, y, w - 135 - 225, 22, TRUE);
+        if (g_browse[i]) MoveWindow(g_browse[i], w - 225, y - 2, 60, 24, TRUE);
+        if (g_install[i]) MoveWindow(g_install[i], w - 160, y - 3, 90, 26, TRUE);
+        if (g_remove[i]) MoveWindow(g_remove[i], w - 62, y - 2, 50, 24, TRUE);
+        if (g_rowStatus[i]) MoveWindow(g_rowStatus[i], 135, y + 26, w - 135 - 20, 18, TRUE);
+    }
+
+    if (g_hRedetect) MoveWindow(g_hRedetect, m, yBottom, 90, 26, TRUE);
+    if (g_hAdv) MoveWindow(g_hAdv, 108, yBottom, 70, 26, TRUE);
+    if (g_hStatus) MoveWindow(g_hStatus, 188, yBottom, w - 198, 26, TRUE);
+}
+
+static void refresh_rows(HWND h)
+{
+    int i;
+    build_rows(h);
+    layout_controls(h);
+    for (i = 0; i < g_rowCount; i++) {
+        fill_path(i);
+        update_status(i);
     }
 }
 
-static void create_controls(HWND h)
+/* 预设行浏览: 选目录并定位主程序;自定义行: 直接选 exe 文件 */
+static void browse_row(int row)
 {
-    HINSTANCE hi = GetModuleHandleW(NULL);
-    const wchar_t *titles[] = { L"名称", L"命令", L"状态", L"主程序" };
-    int widths[] = { 120, 90, 140, 320 };
-
-    g_hList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-        0, 0, 100, 100, h, (HMENU)IDC_LIST, hi, NULL);
-    ListView_SetExtendedListViewStyle(g_hList,
-        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
-    for (int i = 0; i < 4; i++) {
-        LVCOLUMNW col;
-        ZeroMemory(&col, sizeof(col));
-        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-        col.pszText = (wchar_t *)titles[i];
-        col.cx = widths[i];
-        col.iSubItem = i;
-        ListView_InsertColumn(g_hList, i, &col);
+    g_activeRow = row;
+    if (row >= preset_count()) {
+        wchar_t file[MAX_PATH] = L"";
+        OPENFILENAMEW ofn;
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = g_hMain;
+        ofn.lpstrFilter = L"应用程序 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0";
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+        ofn.lpstrTitle = L"选择主程序 exe";
+        if (GetOpenFileNameW(&ofn)) SetWindowTextW(g_edit[row], file);
+        return;
     }
-
-    g_hStatus = CreateWindowExW(0, L"STATIC", L"就绪",
-        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_LEFTNOWORDWRAP,
-        0, 0, 100, 20, h, (HMENU)IDC_STATUS, hi, NULL);
-
     {
-        const wchar_t *labels[] = { L"安装/更新", L"卸载", L"添加自定义", L"移除", L"刷新", L"关闭" };
-        for (int i = 0; i < 6; i++)
-            CreateWindowExW(0, L"BUTTON", labels[i],
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                0, 0, 100, 28, h, (HMENU)(INT_PTR)(IDC_BTN_INSTALL + i), hi, NULL);
-    }
-}
-
-static void do_install(HWND hwnd)
-{
-    int sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
-    wchar_t name[64], codeExe[MAX_PATH], buf[4096];
-    int addedPath = 0, idx;
-
-    if (sel < 0) { SetWindowTextW(g_hStatus, L"请先在列表中选择一个目标。"); return; }
-    if (!row_to_name(sel, name, 64)) return;
-
-    idx = find_target(name);
-    if (idx >= 0 && g_targets[idx].exePath[0]) {
-        wcscpy_s(codeExe, MAX_PATH, g_targets[idx].exePath);   /* 已有记录,直接重装 */
-    } else if (sel < preset_count()) {
-        wchar_t folder[MAX_PATH];                              /* 预设且无记录 → Browse */
-        if (!browse_for_folder(folder, MAX_PATH)) {
-            SetWindowTextW(g_hStatus, L"已取消。");
+        wchar_t folder[MAX_PATH], codeExe[MAX_PATH];
+        if (!browse_for_folder(folder, MAX_PATH)) return;
+        if (!locate_main_exe(folder, PRESETS[row].exeName, codeExe, MAX_PATH)) {
+            SetWindowTextW(g_hStatus, L"所选目录中未找到主程序,仅填入目录。");
+            SetWindowTextW(g_edit[row], folder);
             return;
         }
-        if (!locate_main_exe(folder, PRESETS[sel].exeName, codeExe, MAX_PATH)) {
-            SetWindowTextW(g_hStatus, L"所选目录中未找到主程序,未安装。");
+        SetWindowTextW(g_edit[row], codeExe);
+    }
+}
+
+static void install_row(int row)
+{
+    wchar_t name[64], path[MAX_PATH], codeExe[MAX_PATH], buf[4096];
+    int addedPath = 0, tidx;
+    DWORD attrs;
+
+    g_activeRow = row;
+    if (!row_to_name(row, name, 64)) return;
+    GetWindowTextW(g_edit[row], path, MAX_PATH);
+    if (!path[0] && row < preset_count())
+        detect_app(PRESETS[row].exeName, path, MAX_PATH);
+    if (!path[0]) { SetWindowTextW(g_hStatus, L"请选择或输入主程序路径。"); return; }
+
+    attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) { SetWindowTextW(g_hStatus, L"路径不存在,请重新选择。"); return; }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        const wchar_t *exeName = row_exe_name(row);
+        if (!exeName) { SetWindowTextW(g_hStatus, L"自定义目标需填主程序 exe 文件路径。"); return; }
+        if (!locate_main_exe(path, exeName, codeExe, MAX_PATH)) {
+            SetWindowTextW(g_hStatus, L"所选目录中未找到主程序。");
             return;
         }
     } else {
-        SetWindowTextW(g_hStatus, L"自定义目标缺少主程序路径。");
-        return;
+        wcscpy_s(codeExe, MAX_PATH, path);
     }
 
     SetCursor(LoadCursor(NULL, IDC_WAIT));
     if (install_target(name, codeExe, g_installDir, buf, 4096, &addedPath) == 0) {
         g_addedPath = addedPath;
-        idx = find_target(name);
-        if (idx >= 0)
-            wcscpy_s(g_targets[idx].exePath, MAX_PATH, codeExe);
+        tidx = find_target(name);
+        if (tidx >= 0)
+            wcscpy_s(g_targets[tidx].exePath, MAX_PATH, codeExe);
         else if (g_targetCount < MAX_TARGETS) {
             wcscpy_s(g_targets[g_targetCount].name, 64, name);
             wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, codeExe);
             g_targetCount++;
         }
         save_config();
+        SetWindowTextW(g_edit[row], codeExe);
     }
     SetWindowTextW(g_hStatus, buf);
     SetCursor(LoadCursor(NULL, IDC_ARROW));
-    populate_list();
+    update_status(row);
 }
 
-static void do_uninstall(HWND hwnd)
+static void uninstall_row(int row)
 {
-    int sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
     wchar_t name[64], buf[1024];
 
-    if (sel < 0) { SetWindowTextW(g_hStatus, L"请先选择一个目标。"); return; }
-    if (!row_to_name(sel, name, 64)) return;
-
+    g_activeRow = row;
+    if (!row_to_name(row, name, 64)) return;
     if (uninstall_target(name, g_installDir, buf, 1024) == 0) {
         remove_target_entry(name);
         save_config();
     }
     SetWindowTextW(g_hStatus, buf);
-    populate_list();
+    update_status(row);
 }
 
-static void do_remove(HWND hwnd)
+static void remove_custom_row(int row)
 {
-    int sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
-    wchar_t name[64], buf[512];
+    wchar_t name[64], buf[256];
 
-    if (sel < 0) { SetWindowTextW(g_hStatus, L"请先选择一个目标。"); return; }
-    if (!row_to_name(sel, name, 64)) return;
-
+    g_activeRow = row;
+    if (!row_to_name(row, name, 64)) return;
     remove_target_entry(name);
     save_config();
-    _snwprintf_s(buf, 512, 511, L"已移除 \"%s\" 的记录(已安装的命令不受影响)。", name);
+    _snwprintf_s(buf, 256, 255, L"已移除自定义目标 \"%s\"(已安装的命令不受影响)。", name);
     SetWindowTextW(g_hStatus, buf);
-    populate_list();
+    refresh_rows(g_hMain);
 }
 
-/* ---------- 添加自定义对话框 ---------- */
+static void re_detect_all(void)
+{
+    int i;
+    for (i = 0; i < g_rowCount; i++)
+        if (i < preset_count()) fill_path(i);
+    SetWindowTextW(g_hStatus, L"已重新自动检索路径。");
+}
+
+static void open_config_dir(void)
+{
+    wchar_t dir[MAX_PATH];
+    get_config_dir(dir, MAX_PATH);
+    CreateDirectoryW(dir, NULL);
+    ShellExecuteW(NULL, L"open", dir, NULL, NULL, SW_SHOWNORMAL);
+}
+
+/* ---------- 添加自定义对话框(非核心) ---------- */
 static LRESULT CALLBACK add_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
     switch (msg) {
@@ -1309,35 +1521,90 @@ static int add_custom_dialog(HWND parent)
     return g_addResult;
 }
 
+/* 高级菜单 */
+static void show_adv_menu(HWND h)
+{
+    HMENU m = CreatePopupMenu();
+    wchar_t label[128];
+    RECT rc;
+
+    if (g_activeRow >= 0 && g_activeRow < g_rowCount) {
+        wchar_t nm[64];
+        if (row_to_name(g_activeRow, nm, 64))
+            _snwprintf_s(label, 128, 127, L"卸载 %s", nm);
+        else
+            wcscpy_s(label, 128, L"卸载");
+    } else {
+        wcscpy_s(label, 128, L"卸载(未选择)");
+    }
+    AppendMenuW(m, MF_STRING | (g_activeRow >= 0 ? MF_ENABLED : MF_GRAYED), IDM_UNINSTALL, label);
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_ADD, L"添加自定义…");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_CONFIG, L"打开配置目录");
+    AppendMenuW(m, MF_STRING, IDM_ABOUT, L"关于");
+
+    GetWindowRect(g_hAdv, &rc);
+    SetForegroundWindow(h);
+    TrackPopupMenu(m, TPM_LEFTALIGN | TPM_RIGHTBUTTON, rc.left, rc.bottom, 0, h, NULL);
+    DestroyMenu(m);
+}
+
 /* ---------- 主窗口 ---------- */
 static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
     switch (msg) {
-    case WM_CREATE:
-        create_controls(h);
-        layout_controls(h);
-        populate_list();
+    case WM_CREATE: {
+        HINSTANCE hi = GetModuleHandleW(NULL);
+        g_hMain = h;
+        g_hHeader = CreateWindowExW(0, L"STATIC",
+            L"可用应用（路径自动检测，确认后点「安装」）：",
+            WS_CHILD | WS_VISIBLE, 0, 0, 400, 20, h, NULL, hi, NULL);
+        g_hRedetect = CreateWindowExW(0, L"BUTTON", L"重新检测",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 90, 26, h, (HMENU)IDC_REDETECT, hi, NULL);
+        g_hAdv = CreateWindowExW(0, L"BUTTON", L"高级▾",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 70, 26, h, (HMENU)IDC_ADV, hi, NULL);
+        g_hStatus = CreateWindowExW(0, L"STATIC", L"就绪",
+            WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 0, 0, 400, 26, h, (HMENU)IDC_STATUS, hi, NULL);
+        refresh_rows(h);
         return 0;
+    }
     case WM_SIZE:
         layout_controls(h);
         return 0;
     case WM_COMMAND:
-        switch (LOWORD(w)) {
-        case IDC_BTN_INSTALL:   do_install(h); return 0;
-        case IDC_BTN_UNINSTALL: do_uninstall(h); return 0;
-        case IDC_BTN_ADD:
-            if (add_custom_dialog(h)) { save_config(); populate_list(); }
+        if (LOWORD(w) >= IDC_ROW_BROWSE && LOWORD(w) < IDC_ROW_BROWSE + g_rowCount) {
+            browse_row(LOWORD(w) - IDC_ROW_BROWSE);
             return 0;
-        case IDC_BTN_REMOVE:    do_remove(h); return 0;
-        case IDC_BTN_REFRESH:   populate_list(); return 0;
-        case IDC_BTN_CLOSE:     DestroyWindow(h); return 0;
+        }
+        if (LOWORD(w) >= IDC_ROW_INSTALL && LOWORD(w) < IDC_ROW_INSTALL + g_rowCount) {
+            install_row(LOWORD(w) - IDC_ROW_INSTALL);
+            return 0;
+        }
+        if (LOWORD(w) >= IDC_ROW_REMOVE && LOWORD(w) < IDC_ROW_REMOVE + g_rowCount) {
+            remove_custom_row(LOWORD(w) - IDC_ROW_REMOVE);
+            return 0;
+        }
+        switch (LOWORD(w)) {
+        case IDC_REDETECT: re_detect_all(); return 0;
+        case IDC_ADV: show_adv_menu(h); return 0;
+        case IDM_ADD:
+            if (add_custom_dialog(h)) { save_config(); refresh_rows(h); }
+            return 0;
+        case IDM_UNINSTALL:
+            if (g_activeRow >= 0) uninstall_row(g_activeRow);
+            else SetWindowTextW(g_hStatus, L"请先在某一行点击浏览或安装。");
+            return 0;
+        case IDM_CONFIG: open_config_dir(); return 0;
+        case IDM_ABOUT:
+            MessageBoxW(h, L"openin — 通用「打开到应用」启动器安装器\n\n"
+                          L"把应用注入地址栏: 输入命令,以当前文件夹为参数打开。",
+                        L"关于 openin", MB_OK | MB_ICONINFORMATION);
+            return 0;
         }
         return 0;
-    case WM_NOTIFY:
-        if (((NMHDR *)l)->code == NM_DBLCLK && ((NMHDR *)l)->hwndFrom == g_hList)
-            do_install(h);
-        return 0;
     case WM_DESTROY:
+        destroy_rows();
         PostQuitMessage(0);
         return 0;
     }
@@ -1346,7 +1613,6 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
 
 static int gui_main(void)
 {
-    INITCOMMONCONTROLSEX icc;
     WNDCLASSW wc;
     HWND hwnd;
     MSG msg;
@@ -1354,10 +1620,6 @@ static int gui_main(void)
     load_config();
     if (!g_installDir[0])
         pick_target_dir(NULL, g_installDir, MAX_PATH);
-
-    icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_LISTVIEW_CLASSES;
-    InitCommonControlsEx(&icc);
 
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = main_wnd_proc;
@@ -1370,7 +1632,7 @@ static int gui_main(void)
 
     hwnd = CreateWindowExW(0, g_winClass, L"openin — 打开到应用",
                            WS_OVERLAPPEDWINDOW,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 700, 460,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 700, 420,
                            NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) return 1;
     ShowWindow(hwnd, SW_SHOW);

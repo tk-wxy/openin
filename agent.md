@@ -6,13 +6,13 @@
 ## 构建
 
 ```bat
-gcc -O2 -s -municode -mwindows -o openin.exe openin.c -lshell32 -lole32 -lcomctl32 -lcomdlg32
+gcc -O2 -s -municode -mwindows -o openin.exe openin.c -lshell32 -lole32 -lcomdlg32
 ```
 
 - `-municode`：`wmain` 宽字符入口，正确处理中文/Unicode 路径
 - `-mwindows`：GUI 子系统，运行时不弹黑框
 - `-lshell32 -lole32`：文件夹选择对话框 + COM
-- `-lcomctl32 -lcomdlg32`：ListView / GetOpenFileName（GUI）
+- `-lcomdlg32`：GetOpenFileName 文件选择对话框
 
 ## 核心机制
 
@@ -23,10 +23,13 @@ gcc -O2 -s -municode -mwindows -o openin.exe openin.c -lshell32 -lole32 -lcomctl
 ## GUI（纯 Win32，无 .rc 资源）
 
 - `openin.exe` 无参数 → `gui_main()` 主窗口；带参数 → CLI
-- 主窗口：ListView（名称|命令|状态|主程序）+ 6 按钮（安装/更新、卸载、添加自定义、移除、刷新、关闭）+ 状态 Static
+- 主窗口 = **预设表单行**：每行 [名称静态] [路径 Edit] [浏览] [安装/更新]，自定义行另加 [移除]
+- 底部仅两个按钮：`重新检测`、`高级▾`（菜单：卸载选中、添加自定义…、打开配置目录、关于）
+- **自动检索** `detect_app(exeName)`：PATH 目录 → Programs 常用根(深度2) → 各固定盘根(一层)，首个命中即停
+- `refresh_rows()`：销毁重建所有行控件并填充（路径取已记录或自动检索）
 - 添加自定义：`add_custom_dialog()` 嵌套消息循环模态窗（命令名 + 主程序 exe，GetOpenFileName 浏览）
-- 预设模板 `PRESETS[]`：目前 vscode/Code.exe，追加即可支持更多
-- 状态计算 `target_status()`：`install_dir\<name>.exe|.cmd` 存在 且 dir 在 PATH → 已安装
+- 预设模板 `PRESETS[]`：目前 vscode/Code.exe，追加即可支持更多（cursor/codex…）
+- 状态计算 `is_installed(name)`：`install_dir\<name>.exe|.cmd` 存在 → 已安装（按钮变「更新」）
 
 ## 配置（`%LOCALAPPDATA%\openin\targets.ini`，UTF-8）
 
