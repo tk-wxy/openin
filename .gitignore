@@ -1,0 +1,15 @@
+# 编译产物
+*.exe
+
+# Windows
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 日志
+*.log
