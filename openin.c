@@ -5,10 +5,11 @@
  * 地址栏或终端输入 <命令名> 以当前文件夹为参数打开它。
  *
  * 运行方式:
- *   openin.exe                    弹出文件夹选择框,默认命令名 vscode
- *   openin.exe code               弹出文件夹选择框,命令名 code
- *   openin.exe -d "D:\VS Code"    静默指定目录(命令行模式)
+ *   openin.exe                    弹出 GUI 主窗口
+ *   openin.exe -d "D:\VS Code"    静默指定目录(命令行安装,默认命令名 vscode)
  *   openin.exe -d "D:\VS Code" code   同时指定目录和命令名
+ *   openin.exe -p C:\Users\you\bin    指定安装目录
+ *   openin.exe -u vscode          卸载指定命令
  *
  * 流程:
  *   选择应用目录 → 定位主程序(如 Code.exe) → 生成 launcher 源码(内嵌路径)
@@ -24,6 +25,8 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#include <commctrl.h>
+#include <commdlg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -67,7 +70,7 @@ static BOOL browse_for_folder(wchar_t *out, size_t out_sz)
 
     ZeroMemory(&bi, sizeof(bi));
     bi.hwndOwner = NULL;
-    bi.lpszTitle = L"请选择 VS Code 安装目录 (包含 Code.exe 的文件夹)";
+    bi.lpszTitle = L"请选择应用安装目录 (包含主程序 exe 的文件夹)";
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
     pidl = SHBrowseForFolderW(&bi);
     if (!pidl) return FALSE;
@@ -81,14 +84,15 @@ static BOOL path_exists(const wchar_t *p)
     return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
 }
 
-/* 在 folder 中找 Code.exe;找不到则向上一级再找(兼容选中 bin 子目录的情况) */
-static BOOL locate_code_exe(const wchar_t *folder, wchar_t *out, size_t out_sz)
+/* 在 folder 中找主程序 exeName;找不到则向上一级再找(兼容选中 bin 子目录的情况) */
+static BOOL locate_main_exe(const wchar_t *folder, const wchar_t *exeName,
+                            wchar_t *out, size_t out_sz)
 {
     wchar_t cand[MAX_PATH];
     wchar_t parent[MAX_PATH];
     wchar_t *slash;
 
-    _snwprintf_s(cand, MAX_PATH, MAX_PATH - 1, L"%s\\Code.exe", folder);
+    _snwprintf_s(cand, MAX_PATH, MAX_PATH - 1, L"%s\\%s", folder, exeName);
     if (path_exists(cand)) {
         wcscpy_s(out, out_sz, cand);
         return TRUE;
@@ -97,7 +101,7 @@ static BOOL locate_code_exe(const wchar_t *folder, wchar_t *out, size_t out_sz)
     slash = wcsrchr(parent, L'\\');
     if (slash) *slash = L'\0';
     if (slash && parent[0]) {
-        _snwprintf_s(cand, MAX_PATH, MAX_PATH - 1, L"%s\\Code.exe", parent);
+        _snwprintf_s(cand, MAX_PATH, MAX_PATH - 1, L"%s\\%s", parent, exeName);
         if (path_exists(cand)) {
             wcscpy_s(out, out_sz, cand);
             return TRUE;
@@ -379,11 +383,12 @@ static BOOL run_gcc(const wchar_t *cmdline, const wchar_t *logPath,
 
 /* ---------- 生成 launcher 源码 ---------- */
 /*
- * 生成的 launcher: 启动 Code.exe 打开「当前工作目录」或命令行参数指定路径。
- * 模板按行存放,@@PATH@@ 处替换为转义后的 Code.exe 完整路径。
+ * 生成的 launcher: 启动主程序打开「当前工作目录」或命令行参数指定路径。
+ * 模板按行存放,@@PATH@@ 处替换为转义后的主程序完整路径,@@NAME@@ 为命令名。
  * 使用 wcscat 拼接命令行以避免引号嵌套带来的格式转义问题。
  */
-static BOOL write_launcher_source(const wchar_t *codeExe, const wchar_t *srcPath)
+static BOOL write_launcher_source(const wchar_t *codeExe, const wchar_t *name,
+                                  const wchar_t *srcPath)
 {
     static const wchar_t *TPL[] = {
         L"#define UNICODE",
@@ -434,7 +439,7 @@ static BOOL write_launcher_source(const wchar_t *codeExe, const wchar_t *srcPath
         L"        wchar_t msg[600];",
         L"        _snwprintf_s(msg, 600, 599, L\"Failed to start:\\n%s\\n\\nError: %lu\",",
         L"                     CODE_EXE, (unsigned long)GetLastError());",
-        L"        MessageBoxW(NULL, msg, L\"vscode\", MB_OK | MB_ICONERROR);",
+        L"        MessageBoxW(NULL, msg, L\"@@NAME@@\", MB_OK | MB_ICONERROR);",
         L"        return 1;",
         L"    }",
         L"    CloseHandle(pi.hThread);",
@@ -456,20 +461,28 @@ static BOOL write_launcher_source(const wchar_t *codeExe, const wchar_t *srcPath
 
     for (t = 0; t < sizeof(TPL) / sizeof(TPL[0]); t++) {
         const wchar_t *line = TPL[t];
-        const wchar_t *mark = wcsstr(line, L"@@PATH@@");
+        const wchar_t *pmark = wcsstr(line, L"@@PATH@@");
+        const wchar_t *nmark = wcsstr(line, L"@@NAME@@");
+        const wchar_t *mark = pmark;
+        const wchar_t *subst = codeExe;
+        size_t mlen = 8;
         size_t l = wcslen(line);
 
+        if (nmark && (!pmark || nmark < pmark)) {
+            mark = nmark;
+            subst = name;
+        }
         if (mark) {
             size_t pre = (size_t)(mark - line);
             if (pos + l + 2000 >= CAP) { free(src); return FALSE; }
             memcpy(src + pos, line, pre * sizeof(wchar_t));
             pos += pre;
-            for (const wchar_t *cp = codeExe; *cp; cp++) {
+            for (const wchar_t *cp = subst; *cp; cp++) {
                 if (*cp == L'\\' || *cp == L'"') src[pos++] = L'\\';
                 src[pos++] = *cp;
             }
-            memcpy(src + pos, mark + 8, (l - pre - 8) * sizeof(wchar_t));
-            pos += l - pre - 8;
+            memcpy(src + pos, mark + mlen, (l - pre - mlen) * sizeof(wchar_t));
+            pos += l - pre - mlen;
         } else {
             if (pos + l + 4 >= CAP) { free(src); return FALSE; }
             memcpy(src + pos, line, l * sizeof(wchar_t));
@@ -562,21 +575,831 @@ static int valid_name(const wchar_t *s)
     return 1;
 }
 
-/* ---------- 主流程 ---------- */
+/* ---------- 从用户 PATH 移除目录 ---------- */
+static BOOL remove_from_user_path(const wchar_t *dir)
+{
+    DWORD type = REG_EXPAND_SZ, size = 0;
+    wchar_t *val = NULL, *newval = NULL;
+    BOOL ok = FALSE;
+    LONG r;
+    HKEY hk;
+
+    r = RegGetValueW(HKEY_CURRENT_USER, L"Environment", L"Path",
+                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &type, NULL, &size);
+    if (r != ERROR_SUCCESS || size == 0) return TRUE;   /* 没有 PATH 可改 */
+    val = (wchar_t *)malloc(size + sizeof(wchar_t));
+    if (!val) return FALSE;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Environment", L"Path",
+                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                     &type, val, &size) != ERROR_SUCCESS) {
+        free(val);
+        return FALSE;
+    }
+    val[size / sizeof(wchar_t)] = L'\0';
+
+    if (!path_value_contains(val, dir)) { free(val); return TRUE; }
+
+    {
+        const wchar_t *p = val;
+        size_t cap = wcslen(val) + 2;
+        newval = (wchar_t *)calloc(cap, sizeof(wchar_t));
+        if (!newval) { free(val); return FALSE; }
+        while (*p) {
+            const wchar_t *end = wcschr(p, L';');
+            size_t len = end ? (size_t)(end - p) : wcslen(p);
+            wchar_t entry[MAX_PATH], dirmod[MAX_PATH];
+            size_t i, elen;
+
+            if (len >= MAX_PATH) len = MAX_PATH - 1;
+            for (i = 0; i < len; i++) entry[i] = p[i];
+            entry[len] = L'\0';
+            elen = wcslen(entry);
+            while (elen > 0 && entry[elen - 1] == L'\\') entry[--elen] = L'\0';
+
+            wcscpy_s(dirmod, MAX_PATH, dir);
+            elen = wcslen(dirmod);
+            while (elen > 0 && dirmod[elen - 1] == L'\\') dirmod[--elen] = L'\0';
+
+            if (!(entry[0] && _wcsicmp(entry, dirmod) == 0)) {
+                if (newval[0]) wcscat_s(newval, cap, L";");
+                wcscat_s(newval, cap, entry);
+            }
+            if (!end) break;
+            p = end + 1;
+        }
+    }
+    free(val);
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0,
+                      KEY_SET_VALUE, &hk) == ERROR_SUCCESS) {
+        if (RegSetValueExW(hk, L"Path", 0, type,
+                           (const BYTE *)newval,
+                           (DWORD)((wcslen(newval) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS)
+            ok = TRUE;
+        RegCloseKey(hk);
+    }
+    free(newval);
+
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                        (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
+    return ok;
+}
+
+/* ---------- 配置 (targets.ini: install_dir + added_path + 目标 map) ---------- */
+#define MAX_TARGETS 64
+static wchar_t g_installDir[MAX_PATH];
+static int g_addedPath = 0;
+static int g_createdDir = 0;   /* 安装目录是否为 openin 新建 */
+typedef struct { wchar_t name[64]; wchar_t exePath[MAX_PATH]; } Target;
+static Target g_targets[MAX_TARGETS];
+static int g_targetCount = 0;
+
+static void get_config_dir(wchar_t *out, size_t sz)
+{
+    wchar_t la[MAX_PATH];
+    if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL,
+                         SHGFP_TYPE_CURRENT, la) == S_OK)
+        _snwprintf_s(out, sz, sz - 1, L"%s\\openin", la);
+    else
+        wcscpy_s(out, sz, L"C:\\");
+}
+
+static void load_config(void)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    FILE *f;
+    char buf[1024];
+
+    g_targetCount = 0;
+    g_installDir[0] = L'\0';
+    g_addedPath = 0;
+    g_createdDir = 0;
+
+    get_config_dir(dir, MAX_PATH);
+    _snwprintf_s(path, MAX_PATH, MAX_PATH - 1, L"%s\\targets.ini", dir);
+    f = _wfopen(path, L"rb");
+    if (!f) return;
+    {
+        int section = 0;
+        while (fgets(buf, sizeof(buf), f)) {
+            wchar_t line[1024];
+            int n = MultiByteToWideChar(CP_UTF8, 0, buf, -1, line, 1024);
+            if (n <= 0) continue;
+            {
+                size_t l = wcslen(line);
+                while (l > 0 && (line[l-1] == L'\n' || line[l-1] == L'\r')) line[--l] = L'\0';
+            }
+            if (line[0] == L'[') {
+                section = (_wcsicmp(line, L"[openin]") == 0) ? 1 :
+                          (_wcsicmp(line, L"[targets]") == 0) ? 2 : 0;
+                continue;
+            }
+            if (section == 1) {
+                if (_wcsnicmp(line, L"install_dir=", 12) == 0)
+                    wcscpy_s(g_installDir, MAX_PATH, line + 12);
+                else if (_wcsnicmp(line, L"added_path=", 11) == 0)
+                    g_addedPath = _wtoi(line + 11);
+                else if (_wcsnicmp(line, L"created_dir=", 12) == 0)
+                    g_createdDir = _wtoi(line + 12);
+            } else if (section == 2 && g_targetCount < MAX_TARGETS) {
+                wchar_t *eq = wcschr(line, L'=');
+                if (eq && eq > line) {
+                    *eq = L'\0';
+                    wcscpy_s(g_targets[g_targetCount].name, 64, line);
+                    wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, eq + 1);
+                    g_targetCount++;
+                }
+            }
+        }
+        fclose(f);
+    }
+}
+
+static void save_config(void)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    wchar_t *buf;
+    char *u8;
+    int n, pos = 0;
+    FILE *f;
+    enum { CAP = 40000 };
+
+    get_config_dir(dir, MAX_PATH);
+    CreateDirectoryW(dir, NULL);
+    _snwprintf_s(path, MAX_PATH, MAX_PATH - 1, L"%s\\targets.ini", dir);
+
+    buf = (wchar_t *)malloc(CAP * sizeof(wchar_t));
+    if (!buf) return;
+    pos += _snwprintf_s(buf + pos, CAP - pos, CAP - pos - 1,
+                        L"[openin]\r\ninstall_dir=%s\r\nadded_path=%d\r\ncreated_dir=%d\r\n",
+                        g_installDir[0] ? g_installDir : L"", g_addedPath, g_createdDir);
+    if (g_targetCount > 0) {
+        pos += _snwprintf_s(buf + pos, CAP - pos, CAP - pos - 1, L"[targets]\r\n");
+        for (int i = 0; i < g_targetCount && pos < CAP - 600; i++)
+            pos += _snwprintf_s(buf + pos, CAP - pos, CAP - pos - 1,
+                                L"%s=%s\r\n", g_targets[i].name, g_targets[i].exePath);
+    }
+
+    n = WideCharToMultiByte(CP_UTF8, 0, buf, pos, NULL, 0, NULL, NULL);
+    if (n > 0) {
+        u8 = (char *)malloc((size_t)n + 1);
+        if (u8) {
+            WideCharToMultiByte(CP_UTF8, 0, buf, pos, u8, n, NULL, NULL);
+            u8[n] = '\0';
+            f = _wfopen(path, L"wb");
+            if (f) { fwrite(u8, 1, (size_t)n, f); fclose(f); }
+            free(u8);
+        }
+    }
+    free(buf);
+}
+
+static int find_target(const wchar_t *name)
+{
+    for (int i = 0; i < g_targetCount; i++)
+        if (_wcsicmp(g_targets[i].name, name) == 0) return i;
+    return -1;
+}
+
+static void remove_target_entry(const wchar_t *name)
+{
+    int idx = find_target(name);
+    if (idx < 0) return;
+    for (int j = idx; j < g_targetCount - 1; j++) g_targets[j] = g_targets[j + 1];
+    g_targetCount--;
+}
+
+/* ---------- 安装 / 卸载单个目标 ---------- */
+/*
+ * 安装单个目标: 写 .cmd 备用启动器 → 有 gcc 则编译 .exe → 加入 PATH → 冲突检查。
+ * 成功返回 0,失败返回 1;summary 写入 outSummary。
+ * outAddedPath 记录本次是否真的往用户 PATH 追加了目录。
+ */
+static int install_target(const wchar_t *name, const wchar_t *codeExe,
+                          const wchar_t *installDir,
+                          wchar_t *outSummary, size_t sumSz, int *outAddedPath)
+{
+    wchar_t cmdPath[MAX_PATH], exePath[MAX_PATH], srcPath[MAX_PATH], logPath[MAX_PATH];
+    wchar_t tempDir[MAX_PATH];
+    wchar_t cmdline[1024], logBuf[4096];
+    wchar_t conflictPath[MAX_PATH], gccPath[MAX_PATH];
+    int exeBuilt = 0, pathAlready = 0, conflict = 0, compileFailed = 0;
+
+    if (outAddedPath) *outAddedPath = 0;
+
+    /* 确保安装目录存在(-p 可能指向尚未创建的目录) */
+    {
+        DWORD a = GetFileAttributesW(installDir);
+        if (a == INVALID_FILE_ATTRIBUTES)
+            g_createdDir = CreateDirectoryW(installDir, NULL) ? 1 : 0;
+        else
+            g_createdDir = 0;   /* 目录原本已存在 */
+    }
+
+    _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
+    _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", installDir, name);
+    GetTempPathW(MAX_PATH, tempDir);
+    _snwprintf_s(srcPath, MAX_PATH, MAX_PATH - 1, L"%s%s.c", tempDir, name);
+    _snwprintf_s(logPath, MAX_PATH, MAX_PATH - 1, L"%s%s-build.log", tempDir, name);
+
+    /* .cmd 备用启动器(无需编译器,始终生成) */
+    if (!write_launcher_cmd(codeExe, cmdPath)) {
+        _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                     L"生成 .cmd 备用启动器失败:\n%s", cmdPath);
+        return 1;
+    }
+
+    /* 有 gcc 则编译 .exe(可选) */
+    if (find_in_path(L"gcc.exe", gccPath, MAX_PATH)) {
+        if (write_launcher_source(codeExe, name, srcPath)) {
+            _snwprintf_s(cmdline, 1024, 1023,
+                         L"gcc -O2 -s -municode -mwindows -o \"%s\" \"%s\"", exePath, srcPath);
+            if (run_gcc(cmdline, logPath, logBuf, 4096))
+                exeBuilt = 1;
+            else
+                compileFailed = 1;
+        } else {
+            compileFailed = 1;
+        }
+        /* 临时源码与编译日志用完即删,目标目录零残留 */
+        DeleteFileW(srcPath);
+        DeleteFileW(logPath);
+    }
+
+    /* PATH: 目录已在 PATH 中则无需修改 */
+    pathAlready = path_in_environment(installDir);
+    if (!pathAlready) {
+        if (!add_to_user_path(installDir)) {
+            _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                         L"已生成,但自动加入 PATH 失败。\n请手动把该目录加入用户 PATH:\n%s",
+                         installDir);
+            return 1;
+        }
+        if (outAddedPath) *outAddedPath = 1;
+    }
+
+    /* 冲突检查(.exe 与 .cmd 都要查) */
+    _snwprintf_s(cmdline, 1024, 1023, L"%s.exe", name);
+    if (find_in_path(cmdline, conflictPath, MAX_PATH) && _wcsicmp(conflictPath, exePath) != 0)
+        conflict = 1;
+    if (!conflict) {
+        _snwprintf_s(cmdline, 1024, 1023, L"%s.cmd", name);
+        if (find_in_path(cmdline, conflictPath, MAX_PATH) && _wcsicmp(conflictPath, cmdPath) != 0)
+            conflict = 1;
+    }
+
+    /* 汇总 */
+    if (exeBuilt) {
+        _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                     L"安装完成 ✓\n命令:   %s (.exe)\n备用:   %s.cmd\n"
+                     L"目录:   %s (%s)\n应用:   %s\nlauncher: %s\n\n"
+                     L"地址栏/终端输入 \"%s\" 或 \"%s.cmd\" 即可打开。\n"
+                     L"注意: 已打开的终端/资源管理器需重启生效。%s",
+                     name, name, installDir,
+                     pathAlready ? L"已在 PATH" : L"已加入 PATH",
+                     codeExe, exePath, name, name,
+                     conflict ? L"\n\n⚠ 检测到 PATH 中另有同名命令:\n" : L"");
+    } else {
+        _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                     L"安装完成 ✓ (无 gcc,仅 .cmd)\n命令:   %s.cmd\n"
+                     L"目录:   %s (%s)\n应用:   %s\n\n"
+                     L"终端输入 \"%s\"、地址栏输入 \"%s.cmd\" 即可打开。\n"
+                     L"注意: 已打开的终端/资源管理器需重启生效。%s",
+                     name, installDir,
+                     pathAlready ? L"已在 PATH" : L"已加入 PATH",
+                     codeExe, name, name,
+                     conflict ? L"\n\n⚠ 检测到 PATH 中另有同名命令:\n" : L"");
+    }
+    if (conflict) wcscat_s(outSummary, sumSz, conflictPath);
+    if (compileFailed && !exeBuilt)
+        wcscat_s(outSummary, sumSz, L"\n\n⚠ .exe 编译失败,当前仅 .cmd 生效。");
+    return 0;
+}
+
+/* 卸载目标: 删除 launcher 文件;若 openin 曾加入 PATH 且目录已空,移除 PATH 条目 */
+static int uninstall_target(const wchar_t *name, const wchar_t *installDir,
+                            wchar_t *outSummary, size_t sumSz)
+{
+    wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH];
+    BOOL any = FALSE;
+
+    _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", installDir, name);
+    _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
+    if (DeleteFileW(exePath)) any = TRUE;
+    if (DeleteFileW(cmdPath)) any = TRUE;
+
+    if (!any) {
+        _snwprintf_s(outSummary, sumSz, sumSz - 1, L"\"%s\" 尚未安装,无需卸载。", name);
+        return 1;
+    }
+
+    /* PATH / 目录清理: openin 曾加入 或 曾创建 且 目录已空 → 还原 */
+    {
+        BOOL empty = TRUE;
+        if (g_addedPath || g_createdDir) {
+            wchar_t pat[MAX_PATH];
+            WIN32_FIND_DATAW fd;
+            HANDLE hf;
+            _snwprintf_s(pat, MAX_PATH, MAX_PATH - 1, L"%s\\*", installDir);
+            hf = FindFirstFileW(pat, &fd);
+            if (hf != INVALID_HANDLE_VALUE) {
+                do {
+                    if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+                        empty = FALSE;
+                        break;
+                    }
+                } while (FindNextFileW(hf, &fd));
+                FindClose(hf);
+            }
+        }
+        if (empty) {
+            if (g_addedPath) {
+                remove_from_user_path(installDir);
+                g_addedPath = 0;
+            }
+            if (g_createdDir) {
+                RemoveDirectoryW(installDir);
+                g_createdDir = 0;
+            }
+        }
+    }
+
+    _snwprintf_s(outSummary, sumSz, sumSz - 1, L"已卸载 \"%s\"。", name);
+    return 0;
+}
+
+/* ---------- 预设模板 ---------- */
+typedef struct {
+    const wchar_t *name;     /* 命令名 */
+    const wchar_t *exeName;  /* 主程序文件名,用于目录定位 */
+    const wchar_t *display;  /* 界面显示名 */
+} Preset;
+static const Preset PRESETS[] = {
+    { L"vscode", L"Code.exe", L"VS Code" },
+    /* 后续在此追加: cursor/Cursor.exe, claude/claude.exe, codex/codex.exe ... */
+};
+
+/* ---------- GUI ---------- */
+enum {
+    IDC_LIST = 100,
+    IDC_STATUS = 101,
+    IDC_BTN_INSTALL = 102,
+    IDC_BTN_UNINSTALL = 103,
+    IDC_BTN_ADD = 104,
+    IDC_BTN_REMOVE = 105,
+    IDC_BTN_REFRESH = 106,
+    IDC_BTN_CLOSE = 107,
+    IDC_AD_NAME = 200,
+    IDC_AD_PATH = 201,
+    IDC_AD_BROWSE = 202
+};
+
+static HWND g_hList, g_hStatus;
+static const wchar_t *g_winClass = L"openin_main";
+static int g_addResult = 0;
+
+static int preset_count(void) { return (int)(sizeof(PRESETS) / sizeof(PRESETS[0])); }
+
+/* g_targets 中第 k 个「非预设」项的索引 */
+static int non_preset_index(int k)
+{
+    int seen = 0;
+    for (int i = 0; i < g_targetCount; i++) {
+        int isP = 0;
+        for (int p = 0; p < preset_count(); p++)
+            if (_wcsicmp(PRESETS[p].name, g_targets[i].name) == 0) { isP = 1; break; }
+        if (!isP) {
+            if (seen == k) return i;
+            seen++;
+        }
+    }
+    return -1;
+}
+
+/* 列表行 → 命令名(返回 0 失败) */
+static int row_to_name(int row, wchar_t *name, size_t sz)
+{
+    if (row < preset_count()) {
+        wcscpy_s(name, sz, PRESETS[row].name);
+        return 1;
+    }
+    {
+        int idx = non_preset_index(row - preset_count());
+        if (idx >= 0) {
+            wcscpy_s(name, sz, g_targets[idx].name);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 计算某命令的安装状态 */
+static void target_status(const wchar_t *name, wchar_t *out, size_t sz)
+{
+    wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH];
+    BOOL present;
+
+    if (!g_installDir[0]) {
+        wcscpy_s(out, sz, L"未安装");
+        return;
+    }
+    _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", g_installDir, name);
+    _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", g_installDir, name);
+    present = path_exists(exePath) || path_exists(cmdPath);
+    if (present)
+        wcscpy_s(out, sz, path_in_environment(g_installDir) ? L"已安装" : L"已安装(PATH 缺失)");
+    else
+        wcscpy_s(out, sz, L"未安装");
+}
+
+static void populate_list(void)
+{
+    LVITEMW item;
+    int row = 0, i, p;
+
+    if (!g_hList) return;
+    ListView_DeleteAllItems(g_hList);
+
+    /* 预设行 */
+    for (i = 0; i < preset_count(); i++) {
+        wchar_t status[64];
+        ZeroMemory(&item, sizeof(item));
+        item.mask = LVIF_TEXT;
+        item.iItem = row;
+        item.iSubItem = 0;
+        item.pszText = (wchar_t *)PRESETS[i].display;
+        ListView_InsertItem(g_hList, &item);
+        ListView_SetItemText(g_hList, row, 1, (wchar_t *)PRESETS[i].name);
+        target_status(PRESETS[i].name, status, 64);
+        ListView_SetItemText(g_hList, row, 2, status);
+        ListView_SetItemText(g_hList, row, 3, (wchar_t *)PRESETS[i].exeName);
+        row++;
+    }
+    /* 自定义行(非预设的目标) */
+    for (i = 0; i < g_targetCount; i++) {
+        int isP = 0;
+        for (p = 0; p < preset_count(); p++)
+            if (_wcsicmp(PRESETS[p].name, g_targets[i].name) == 0) { isP = 1; break; }
+        if (isP) continue;
+        {
+            wchar_t status[64], disp[160];
+            ZeroMemory(&item, sizeof(item));
+            item.mask = LVIF_TEXT;
+            item.iItem = row;
+            item.iSubItem = 0;
+            _snwprintf_s(disp, 160, 159, L"%s (自定义)", g_targets[i].name);
+            item.pszText = disp;
+            ListView_InsertItem(g_hList, &item);
+            ListView_SetItemText(g_hList, row, 1, g_targets[i].name);
+            target_status(g_targets[i].name, status, 64);
+            ListView_SetItemText(g_hList, row, 2, status);
+            ListView_SetItemText(g_hList, row, 3, g_targets[i].exePath);
+            row++;
+        }
+    }
+}
+
+static void layout_controls(HWND h)
+{
+    RECT rc;
+    int m = 10, btnH = 28, statusH = 56;
+    int w, yBtn;
+
+    GetClientRect(h, &rc);
+    w = rc.right - rc.left;
+    yBtn = rc.bottom - m - btnH;
+    if (g_hList)
+        MoveWindow(g_hList, m, m, w - 2 * m, yBtn - m - statusH - m, TRUE);
+    if (g_hStatus)
+        MoveWindow(g_hStatus, m, yBtn - m - statusH, w - 2 * m, statusH, TRUE);
+    for (int i = 0; i < 6; i++) {
+        HWND btn = GetDlgItem(h, IDC_BTN_INSTALL + i);
+        if (btn) MoveWindow(btn, m + i * 108, yBtn, 100, btnH, TRUE);
+    }
+}
+
+static void create_controls(HWND h)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    const wchar_t *titles[] = { L"名称", L"命令", L"状态", L"主程序" };
+    int widths[] = { 120, 90, 140, 320 };
+
+    g_hList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        0, 0, 100, 100, h, (HMENU)IDC_LIST, hi, NULL);
+    ListView_SetExtendedListViewStyle(g_hList,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    for (int i = 0; i < 4; i++) {
+        LVCOLUMNW col;
+        ZeroMemory(&col, sizeof(col));
+        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+        col.pszText = (wchar_t *)titles[i];
+        col.cx = widths[i];
+        col.iSubItem = i;
+        ListView_InsertColumn(g_hList, i, &col);
+    }
+
+    g_hStatus = CreateWindowExW(0, L"STATIC", L"就绪",
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_LEFTNOWORDWRAP,
+        0, 0, 100, 20, h, (HMENU)IDC_STATUS, hi, NULL);
+
+    {
+        const wchar_t *labels[] = { L"安装/更新", L"卸载", L"添加自定义", L"移除", L"刷新", L"关闭" };
+        for (int i = 0; i < 6; i++)
+            CreateWindowExW(0, L"BUTTON", labels[i],
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                0, 0, 100, 28, h, (HMENU)(INT_PTR)(IDC_BTN_INSTALL + i), hi, NULL);
+    }
+}
+
+static void do_install(HWND hwnd)
+{
+    int sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
+    wchar_t name[64], codeExe[MAX_PATH], buf[4096];
+    int addedPath = 0, idx;
+
+    if (sel < 0) { SetWindowTextW(g_hStatus, L"请先在列表中选择一个目标。"); return; }
+    if (!row_to_name(sel, name, 64)) return;
+
+    idx = find_target(name);
+    if (idx >= 0 && g_targets[idx].exePath[0]) {
+        wcscpy_s(codeExe, MAX_PATH, g_targets[idx].exePath);   /* 已有记录,直接重装 */
+    } else if (sel < preset_count()) {
+        wchar_t folder[MAX_PATH];                              /* 预设且无记录 → Browse */
+        if (!browse_for_folder(folder, MAX_PATH)) {
+            SetWindowTextW(g_hStatus, L"已取消。");
+            return;
+        }
+        if (!locate_main_exe(folder, PRESETS[sel].exeName, codeExe, MAX_PATH)) {
+            SetWindowTextW(g_hStatus, L"所选目录中未找到主程序,未安装。");
+            return;
+        }
+    } else {
+        SetWindowTextW(g_hStatus, L"自定义目标缺少主程序路径。");
+        return;
+    }
+
+    SetCursor(LoadCursor(NULL, IDC_WAIT));
+    if (install_target(name, codeExe, g_installDir, buf, 4096, &addedPath) == 0) {
+        g_addedPath = addedPath;
+        idx = find_target(name);
+        if (idx >= 0)
+            wcscpy_s(g_targets[idx].exePath, MAX_PATH, codeExe);
+        else if (g_targetCount < MAX_TARGETS) {
+            wcscpy_s(g_targets[g_targetCount].name, 64, name);
+            wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, codeExe);
+            g_targetCount++;
+        }
+        save_config();
+    }
+    SetWindowTextW(g_hStatus, buf);
+    SetCursor(LoadCursor(NULL, IDC_ARROW));
+    populate_list();
+}
+
+static void do_uninstall(HWND hwnd)
+{
+    int sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
+    wchar_t name[64], buf[1024];
+
+    if (sel < 0) { SetWindowTextW(g_hStatus, L"请先选择一个目标。"); return; }
+    if (!row_to_name(sel, name, 64)) return;
+
+    if (uninstall_target(name, g_installDir, buf, 1024) == 0) {
+        remove_target_entry(name);
+        save_config();
+    }
+    SetWindowTextW(g_hStatus, buf);
+    populate_list();
+}
+
+static void do_remove(HWND hwnd)
+{
+    int sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
+    wchar_t name[64], buf[512];
+
+    if (sel < 0) { SetWindowTextW(g_hStatus, L"请先选择一个目标。"); return; }
+    if (!row_to_name(sel, name, 64)) return;
+
+    remove_target_entry(name);
+    save_config();
+    _snwprintf_s(buf, 512, 511, L"已移除 \"%s\" 的记录(已安装的命令不受影响)。", name);
+    SetWindowTextW(g_hStatus, buf);
+    populate_list();
+}
+
+/* ---------- 添加自定义对话框 ---------- */
+static LRESULT CALLBACK add_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        HINSTANCE hi = GetModuleHandleW(NULL);
+        CreateWindowExW(0, L"STATIC", L"命令名:", WS_CHILD | WS_VISIBLE, 12, 14, 70, 20, h, NULL, hi, NULL);
+        CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 86, 12, 210, 22,
+            h, (HMENU)IDC_AD_NAME, hi, NULL);
+        CreateWindowExW(0, L"STATIC", L"主程序:", WS_CHILD | WS_VISIBLE, 12, 44, 70, 20, h, NULL, hi, NULL);
+        CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 86, 42, 210, 22,
+            h, (HMENU)IDC_AD_PATH, hi, NULL);
+        CreateWindowExW(0, L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            302, 42, 80, 22, h, (HMENU)IDC_AD_BROWSE, hi, NULL);
+        CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            170, 96, 80, 28, h, (HMENU)IDOK, hi, NULL);
+        CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            270, 96, 80, 28, h, (HMENU)IDCANCEL, hi, NULL);
+        SetFocus(GetDlgItem(h, IDC_AD_NAME));
+        return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case IDC_AD_BROWSE: {
+            wchar_t file[MAX_PATH] = L"";
+            OPENFILENAMEW ofn;
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = h;
+            ofn.lpstrFilter = L"应用程序 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0";
+            ofn.lpstrFile = file;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+            ofn.lpstrTitle = L"选择主程序 exe";
+            if (GetOpenFileNameW(&ofn))
+                SetWindowTextW(GetDlgItem(h, IDC_AD_PATH), file);
+            return 0;
+        }
+        case IDOK: {
+            wchar_t nm[64], path[MAX_PATH];
+            GetWindowTextW(GetDlgItem(h, IDC_AD_NAME), nm, 64);
+            GetWindowTextW(GetDlgItem(h, IDC_AD_PATH), path, MAX_PATH);
+            if (!valid_name(nm)) {
+                MessageBoxW(h, L"命令名只能包含字母、数字、下划线和短横线。",
+                            L"openin", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            if (!path[0] || !path_exists(path)) {
+                MessageBoxW(h, L"请选择有效的主程序 exe 文件。",
+                            L"openin", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            {
+                int idx = find_target(nm);
+                if (idx >= 0)
+                    wcscpy_s(g_targets[idx].exePath, MAX_PATH, path);
+                else if (g_targetCount < MAX_TARGETS) {
+                    wcscpy_s(g_targets[g_targetCount].name, 64, nm);
+                    wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, path);
+                    g_targetCount++;
+                }
+            }
+            g_addResult = 1;
+            DestroyWindow(h);
+            return 0;
+        }
+        case IDCANCEL:
+            g_addResult = 0;
+            DestroyWindow(h);
+            return 0;
+        }
+        return 0;
+    case WM_CLOSE:
+        g_addResult = 0;
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+/* 模态式添加自定义窗口(嵌套消息循环),返回是否新增 */
+static int add_custom_dialog(HWND parent)
+{
+    const wchar_t *cls = L"openin_add";
+    WNDCLASSW wc;
+    HWND h;
+    MSG msg;
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = add_wnd_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassW(&wc);
+
+    h = CreateWindowExW(0, cls, L"添加自定义目标",
+                        WS_CAPTION | WS_SYSMENU | WS_POPUP,
+                        CW_USEDEFAULT, CW_USEDEFAULT, 400, 170,
+                        parent, NULL, wc.hInstance, NULL);
+    if (!h) return 0;
+    g_addResult = 0;
+    ShowWindow(h, SW_SHOW);
+    UpdateWindow(h);
+
+    EnableWindow(parent, FALSE);
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (IsDialogMessageW(h, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+    return g_addResult;
+}
+
+/* ---------- 主窗口 ---------- */
+static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_CREATE:
+        create_controls(h);
+        layout_controls(h);
+        populate_list();
+        return 0;
+    case WM_SIZE:
+        layout_controls(h);
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case IDC_BTN_INSTALL:   do_install(h); return 0;
+        case IDC_BTN_UNINSTALL: do_uninstall(h); return 0;
+        case IDC_BTN_ADD:
+            if (add_custom_dialog(h)) { save_config(); populate_list(); }
+            return 0;
+        case IDC_BTN_REMOVE:    do_remove(h); return 0;
+        case IDC_BTN_REFRESH:   populate_list(); return 0;
+        case IDC_BTN_CLOSE:     DestroyWindow(h); return 0;
+        }
+        return 0;
+    case WM_NOTIFY:
+        if (((NMHDR *)l)->code == NM_DBLCLK && ((NMHDR *)l)->hwndFrom == g_hList)
+            do_install(h);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+static int gui_main(void)
+{
+    INITCOMMONCONTROLSEX icc;
+    WNDCLASSW wc;
+    HWND hwnd;
+    MSG msg;
+
+    load_config();
+    if (!g_installDir[0])
+        pick_target_dir(NULL, g_installDir, MAX_PATH);
+
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_LISTVIEW_CLASSES;
+    InitCommonControlsEx(&icc);
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = main_wnd_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = g_winClass;
+    RegisterClassW(&wc);
+
+    hwnd = CreateWindowExW(0, g_winClass, L"openin — 打开到应用",
+                           WS_OVERLAPPEDWINDOW,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 700, 460,
+                           NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd) return 1;
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return (int)msg.wParam;
+}
+
+/* ---------- 主流程: 无参数进 GUI,有参数走 CLI ---------- */
 int wmain(int argc, wchar_t *argv[])
 {
     wchar_t name[64];
     wchar_t folder[MAX_PATH];
     wchar_t codeExe[MAX_PATH];
     wchar_t installDir[MAX_PATH];
-    wchar_t srcPath[MAX_PATH], exePath[MAX_PATH], cmdPath[MAX_PATH], logPath[MAX_PATH];
-    wchar_t cmdline[1024];
-    wchar_t logBuf[4096];
     wchar_t buf[4096];
-    wchar_t conflictPath[MAX_PATH], gccPath[MAX_PATH];
-    wchar_t localApp[MAX_PATH];
     wchar_t targetOverride[MAX_PATH];
-    int quiet = 0, i, conflict = 0, exeBuilt = 0, pathAlready = 0;
+    wchar_t localApp[MAX_PATH];
+    int quiet = 0, i, addedPath = 0, rc, uninstallMode = 0;
+
+    if (argc <= 1) {
+        return gui_main();                       /* 双击/无参数 → GUI */
+    }
+
+    load_config();                               /* 与 GUI 共享配置 */
 
     /* 解析参数 */
     wcscpy_s(name, 64, L"vscode");
@@ -590,6 +1413,11 @@ int wmain(int argc, wchar_t *argv[])
         }
         if (_wcsicmp(argv[i], L"-p") == 0 && i + 1 < argc) {
             wcscpy_s(targetOverride, MAX_PATH, argv[++i]);
+            continue;
+        }
+        if (_wcsicmp(argv[i], L"-u") == 0 && i + 1 < argc) {
+            wcscpy_s(name, 64, argv[++i]);
+            uninstallMode = 1;
             continue;
         }
         /* 其它参数视为命令名 */
@@ -611,116 +1439,59 @@ int wmain(int argc, wchar_t *argv[])
         }
     }
 
-    /* 选择 VS Code 目录 */
+    /* 卸载模式 */
+    if (uninstallMode) {
+        wchar_t ubuf[1024];
+        int urc = uninstall_target(name, g_installDir, ubuf, 1024);
+        if (urc == 0) {
+            remove_target_entry(name);
+            save_config();
+        }
+        show(L"openin", ubuf, urc == 0 ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONERROR);
+        return urc;
+    }
+
+    /* 选择应用目录 */
     if (!folder[0]) {
         if (!browse_for_folder(folder, MAX_PATH)) return 0;
     }
 
-    /* 定位 Code.exe */
-    if (!locate_code_exe(folder, codeExe, MAX_PATH)) {
-        _snwprintf_s(buf, 4096, 4095,
-                     L"在所选目录中未找到 Code.exe:\n%s\n\n请确认你选择的是 VS Code 的安装目录。",
-                     folder);
-        show(L"openin", buf, MB_OK | MB_ICONERROR);
-        return 1;
+    /* 定位主程序(默认预设 vscode/Code.exe) */
+    {
+        const wchar_t *exeName = L"Code.exe";
+        for (i = 0; i < preset_count(); i++)
+            if (_wcsicmp(PRESETS[i].name, name) == 0) { exeName = PRESETS[i].exeName; break; }
+        if (!locate_main_exe(folder, exeName, codeExe, MAX_PATH)) {
+            _snwprintf_s(buf, 4096, 4095,
+                         L"在所选目录中未找到 %s:\n%s\n\n请确认选择了正确的应用目录。",
+                         exeName, folder);
+            show(L"openin", buf, MB_OK | MB_ICONERROR);
+            return 1;
+        }
     }
 
     /* 选择安装目录(自动: ~\.local\bin > %APPDATA%\npm > 创建 > 回退) */
     pick_target_dir(targetOverride, installDir, MAX_PATH);
 
-    _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
-    _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", installDir, name);
-    {
-        wchar_t tempDir[MAX_PATH];
-        GetTempPathW(MAX_PATH, tempDir);   /* .c 源码与编译日志都放临时目录,目标目录零残留 */
-        _snwprintf_s(srcPath, MAX_PATH, MAX_PATH - 1, L"%s%s.c", tempDir, name);
-        _snwprintf_s(logPath, MAX_PATH, MAX_PATH - 1, L"%s%s-build.log", tempDir, name);
-    }
-
-    /* 先写 .cmd 备用启动器(无需编译器,始终生成,保证冗余) */
-    if (!write_launcher_cmd(codeExe, cmdPath)) {
-        show(L"openin", L"生成 .cmd 备用启动器失败。", MB_OK | MB_ICONERROR);
-        return 1;
-    }
-
-    /* 尝试用 gcc 编译 .exe(可选;无 gcc 则仅保留 .cmd) */
-    if (find_in_path(L"gcc.exe", gccPath, MAX_PATH)) {
-        if (write_launcher_source(codeExe, srcPath)) {
-            _snwprintf_s(cmdline, 1024, 1023,
-                         L"gcc -O2 -s -municode -mwindows -o \"%s\" \"%s\"", exePath, srcPath);
-            if (run_gcc(cmdline, logPath, logBuf, 4096)) {
-                exeBuilt = 1;
-            } else {
-                _snwprintf_s(buf, 4096, 4095,
-                             L"编译 .exe 失败(已保留 .cmd 备用)。\n\n%s",
-                             logBuf[0] ? logBuf : L"(无输出)");
-                show(L"openin", buf, MB_OK | MB_ICONWARNING);
+    rc = install_target(name, codeExe, installDir, buf, 4096, &addedPath);
+    if (rc == 0) {
+        /* 持久化,便于 GUI 识别状态 */
+        wcscpy_s(g_installDir, MAX_PATH, installDir);
+        g_addedPath = addedPath;
+        {
+            int tidx = find_target(name);
+            if (tidx >= 0)
+                wcscpy_s(g_targets[tidx].exePath, MAX_PATH, codeExe);
+            else if (g_targetCount < MAX_TARGETS) {
+                wcscpy_s(g_targets[g_targetCount].name, 64, name);
+                wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, codeExe);
+                g_targetCount++;
             }
-        } else {
-            show(L"openin", L"生成 C 源码失败(已保留 .cmd 备用)。",
-                 MB_OK | MB_ICONWARNING);
         }
-        /* 临时源码与编译日志用完即删,目标目录零残留 */
-        DeleteFileW(srcPath);
-        DeleteFileW(logPath);
-    } else {
-        _snwprintf_s(buf, 4096, 4095,
-                     L"未在 PATH 中找到 gcc.exe,已生成 .cmd 备用启动器(跳过 .exe 编译)。\n\n"
-                     L"提示: 终端里输入 \"%s\"、资源管理器地址栏输入 \"%s.cmd\" 均可打开 VS Code。",
-                     name, name);
+        save_config();
         show(L"openin", buf, MB_OK | MB_ICONINFORMATION);
-    }
-
-    /* PATH: 目标目录已在 PATH 中则无需修改 */
-    pathAlready = path_in_environment(installDir);
-    if (!pathAlready && !add_to_user_path(installDir)) {
-        _snwprintf_s(buf, 4096, 4095,
-                     L"已生成,但自动加入 PATH 失败。\n\n"
-                     L"请手动把以下目录加入「用户环境变量 → Path」:\n\n%s",
-                     installDir);
-        show(L"openin", buf, MB_OK | MB_ICONWARNING);
-        return 1;
-    }
-
-    /* 冲突检查(.exe 与 .cmd 都要查) */
-    _snwprintf_s(buf, 4096, 4095, L"%s.exe", name);
-    if (find_in_path(buf, conflictPath, MAX_PATH) && _wcsicmp(conflictPath, exePath) != 0)
-        conflict = 1;
-    if (!conflict) {
-        _snwprintf_s(buf, 4096, 4095, L"%s.cmd", name);
-        if (find_in_path(buf, conflictPath, MAX_PATH) && _wcsicmp(conflictPath, cmdPath) != 0)
-            conflict = 1;
-    }
-
-    /* 汇总 */
-    if (exeBuilt) {
-        _snwprintf_s(buf, 4096, 4095,
-                     L"安装完成 ✓\n\n"
-                     L"命令:   %s (.exe)\n"
-                     L"备用:   %s.cmd\n"
-                     L"目录:   %s (%s)\n"
-                     L"VS Code: %s\n"
-                     L"launcher: %s\n\n"
-                     L"地址栏/终端输入 \"%s\" 或 \"%s.cmd\" 均可打开 VS Code。\n"
-                     L"注意: 已打开的终端/资源管理器窗口需重启后才会生效。%s",
-                     name, name, installDir,
-                     pathAlready ? L"已在 PATH" : L"已加入 PATH",
-                     codeExe, exePath, name, name,
-                     conflict ? L"\n\n⚠ 检测到 PATH 中另有同名命令,当前仍会优先解析到:\n" : L"");
     } else {
-        _snwprintf_s(buf, 4096, 4095,
-                     L"安装完成 ✓ (无 gcc,仅 .cmd 模式)\n\n"
-                     L"命令:   %s.cmd\n"
-                     L"目录:   %s (%s)\n"
-                     L"VS Code: %s\n\n"
-                     L"终端里输入 \"%s\"、资源管理器地址栏输入 \"%s.cmd\" 均可打开 VS Code。\n"
-                     L"注意: 已打开的终端/资源管理器窗口需重启后才会生效。%s",
-                     name, installDir,
-                     pathAlready ? L"已在 PATH" : L"已加入 PATH",
-                     codeExe, name, name,
-                     conflict ? L"\n\n⚠ 检测到 PATH 中另有同名命令,当前仍会优先解析到:\n" : L"");
+        show(L"openin", buf, MB_OK | MB_ICONERROR);
     }
-    if (conflict) wcscat_s(buf, 4096, conflictPath);
-    show(L"openin", buf, MB_OK | MB_ICONINFORMATION);
-    return 0;
+    return rc;
 }

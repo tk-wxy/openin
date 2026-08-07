@@ -15,16 +15,19 @@ Codex……），安装后即可用一行命令以「当前文件夹」为参数
 
 ## 使用
 
-### 交互模式（推荐）
-双击 `openin.exe` → 弹出文件夹选择框 → 选中目标应用目录（如含 `Code.exe` 的文件夹）
-→ 自动生成、编译启动器 → 自动处理 PATH → 完成。
+### GUI 界面（推荐）
+双击 `openin.exe`（或无参数运行）打开**管理主窗口**：列表罗列可注入的应用
+（预设 + 自定义），选中后点「安装/更新」即可；还支持卸载、添加自定义、移除、刷新。
+自定义目标与安装状态持久化在 `%LOCALAPPDATA%\openin\targets.ini`。
 
 ### 命令行模式
 ```bat
-openin.exe -d "D:\Microsoft VS Code"              :: 指定应用目录
-openin.exe -d "D:\Microsoft VS Code" code         :: 自定义命令名
-openin.exe -p C:\Users\you\bin -d "D:\VS Code"    :: 指定安装目录
-openin.exe -q -d "D:\..."                         :: 静默模式，结果写入日志
+openin.exe                                  :: 打开 GUI 主窗口
+openin.exe -d "D:\Microsoft VS Code"        :: 指定应用目录安装（默认命令名 vscode）
+openin.exe -d "D:\Microsoft VS Code" code   :: 自定义命令名
+openin.exe -p C:\Users\you\bin -d "D:\VS Code"   :: 指定安装目录
+openin.exe -u vscode                        :: 卸载指定命令
+openin.exe -q -d "D:\..."                   :: 静默模式，结果写入日志
 ```
 
 > 每个应用装一次，得到一个独立命令：`openin.exe -d "D:\...\Code.exe的目录" vscode`、
@@ -105,9 +108,10 @@ PATH 中，因此多数情况**无需修改 PATH**）：
 ## 路线图
 
 - [x] VS Code 支持（首个应用）
-- [ ] 图形界面管理：列出/移除已安装的命令
+- [x] 图形界面管理：多目标列表、安装/更新、卸载、添加自定义、移除、刷新
 - [ ] 预设应用模板（Cursor、Claude、Codex、Windsurf……），免手动选目录
 - [ ] 无 gcc 环境默认分发预编译 launcher
+- [ ] 系统托盘常驻 / 开机自启动
 
 ## 故障排查
 
