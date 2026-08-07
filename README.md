@@ -23,6 +23,30 @@ vscode-installer.exe -p C:\Users\you\bin -d "D:\VS Code"    :: 指定安装目�
 vscode-installer.exe -q -d "D:\..."                         :: 静默模式，结果写入日志
 ```
 
+## 从源码构建
+
+需要 **MinGW-w64（gcc）**，并确保 `gcc` 在 PATH 中：
+
+```bat
+:: 安装 gcc（已装则跳过）
+winget install BrechtSanders.WinLibs.POSIX.UCRT
+
+:: 编译
+gcc -O2 -s -municode -mwindows -o vscode-installer.exe vscode-installer.c -lshell32 -lole32
+```
+
+编译参数说明：
+
+| 参数 | 作用 |
+|---|---|
+| `-municode` | 使用 `wmain` 宽字符入口，正确处理中文 / Unicode 路径 |
+| `-mwindows` | GUI 子系统，运行时不弹出黑框 |
+| `-O2 -s` | 优化并去符号瘦身（产物约 31 KB） |
+| `-lshell32 -lole32` | 链接文件夹选择对话框与 COM 所需系统库 |
+
+产物 `vscode-installer.exe` 是**单文件便携程序**，可拷到任何 Windows 机器直接双击运行，
+目标机器无需安装编译器。
+
 ## 安装位置（自动选择通用目录）
 
 启动器**不放进专属文件夹**，而是自动挑选一个通用、常用的用户 bin 目录（这些目录通常已在
