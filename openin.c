@@ -18,7 +18,9 @@
  *
  * 说明:
  *   - 只改 HKCU 的 Path,不需要管理员权限
- *   - -q 静默模式: 不弹 MessageBox,结果写入 %LOCALAPPDATA%\openin.log
+ *   - 无状态: 只创建启动文件(<name>.exe/.cmd),不产生任何配置、日志或外部文件夹;
+ *     临时编译产物用完即删
+ *   - -q 静默模式: 不弹 MessageBox,无任何输出
  */
 #define UNICODE
 #define _UNICODE
@@ -32,33 +34,12 @@
 #include <string.h>
 
 static int g_quiet = 0;
-static wchar_t g_logpath[MAX_PATH];
-static const wchar_t *g_logfile = NULL;
 
-/* ---------- 输出(静默模式下写日志) ---------- */
+/* ---------- 输出(静默模式下不弹窗、不产生任何文件) ---------- */
 static void show(const wchar_t *title, const wchar_t *text, UINT flags)
 {
-    if (!g_quiet) {
+    if (!g_quiet)
         MessageBoxW(NULL, text, title, flags);
-        return;
-    }
-    HANDLE h = CreateFileW(g_logfile, FILE_APPEND_DATA, FILE_SHARE_READ,
-                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    {
-        wchar_t tmp[5200];
-        int n = _snwprintf_s(tmp, 5200, 5199, L"[%s] %s\n", title, text);
-        if (n > 0) {
-            char *u8 = (char *)malloc(n * 3 + 8);
-            if (u8) {
-                int blen = WideCharToMultiByte(CP_UTF8, 0, tmp, n, u8, n * 3, NULL, NULL);
-                DWORD w = 0;
-                WriteFile(h, u8, (DWORD)blen, &w, NULL);
-                free(u8);
-            }
-        }
-        CloseHandle(h);
-    }
 }
 
 /* ---------- 文件夹选择 ---------- */
@@ -662,184 +643,12 @@ static int valid_name(const wchar_t *s)
     return 1;
 }
 
-/* ---------- 从用户 PATH 移除目录 ---------- */
-static BOOL remove_from_user_path(const wchar_t *dir)
-{
-    DWORD type = REG_EXPAND_SZ, size = 0;
-    wchar_t *val = NULL, *newval = NULL;
-    BOOL ok = FALSE;
-    LONG r;
-    HKEY hk;
-
-    r = RegGetValueW(HKEY_CURRENT_USER, L"Environment", L"Path",
-                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &type, NULL, &size);
-    if (r != ERROR_SUCCESS || size == 0) return TRUE;   /* 没有 PATH 可改 */
-    val = (wchar_t *)malloc(size + sizeof(wchar_t));
-    if (!val) return FALSE;
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Environment", L"Path",
-                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
-                     &type, val, &size) != ERROR_SUCCESS) {
-        free(val);
-        return FALSE;
-    }
-    val[size / sizeof(wchar_t)] = L'\0';
-
-    if (!path_value_contains(val, dir)) { free(val); return TRUE; }
-
-    {
-        const wchar_t *p = val;
-        size_t cap = wcslen(val) + 2;
-        newval = (wchar_t *)calloc(cap, sizeof(wchar_t));
-        if (!newval) { free(val); return FALSE; }
-        while (*p) {
-            const wchar_t *end = wcschr(p, L';');
-            size_t len = end ? (size_t)(end - p) : wcslen(p);
-            wchar_t entry[MAX_PATH], dirmod[MAX_PATH];
-            size_t i, elen;
-
-            if (len >= MAX_PATH) len = MAX_PATH - 1;
-            for (i = 0; i < len; i++) entry[i] = p[i];
-            entry[len] = L'\0';
-            elen = wcslen(entry);
-            while (elen > 0 && entry[elen - 1] == L'\\') entry[--elen] = L'\0';
-
-            wcscpy_s(dirmod, MAX_PATH, dir);
-            elen = wcslen(dirmod);
-            while (elen > 0 && dirmod[elen - 1] == L'\\') dirmod[--elen] = L'\0';
-
-            if (!(entry[0] && _wcsicmp(entry, dirmod) == 0)) {
-                if (newval[0]) wcscat_s(newval, cap, L";");
-                wcscat_s(newval, cap, entry);
-            }
-            if (!end) break;
-            p = end + 1;
-        }
-    }
-    free(val);
-
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0,
-                      KEY_SET_VALUE, &hk) == ERROR_SUCCESS) {
-        if (RegSetValueExW(hk, L"Path", 0, type,
-                           (const BYTE *)newval,
-                           (DWORD)((wcslen(newval) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS)
-            ok = TRUE;
-        RegCloseKey(hk);
-    }
-    free(newval);
-
-    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
-                        (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
-    return ok;
-}
-
-/* ---------- 配置 (targets.ini: install_dir + added_path + 目标 map) ---------- */
+/* ---------- 目标(仅会话内存,不持久化、不产生任何外部文件) ---------- */
 #define MAX_TARGETS 64
-static wchar_t g_installDir[MAX_PATH];
-static int g_addedPath = 0;
-static int g_createdDir = 0;   /* 安装目录是否为 openin 新建 */
+static wchar_t g_installDir[MAX_PATH];   /* 每次运行由 pick_target_dir 计算,不落盘 */
 typedef struct { wchar_t name[64]; wchar_t exePath[MAX_PATH]; } Target;
 static Target g_targets[MAX_TARGETS];
 static int g_targetCount = 0;
-
-static void get_config_dir(wchar_t *out, size_t sz)
-{
-    wchar_t la[MAX_PATH];
-    if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL,
-                         SHGFP_TYPE_CURRENT, la) == S_OK)
-        _snwprintf_s(out, sz, sz - 1, L"%s\\openin", la);
-    else
-        wcscpy_s(out, sz, L"C:\\");
-}
-
-static void load_config(void)
-{
-    wchar_t dir[MAX_PATH], path[MAX_PATH];
-    FILE *f;
-    char buf[1024];
-
-    g_targetCount = 0;
-    g_installDir[0] = L'\0';
-    g_addedPath = 0;
-    g_createdDir = 0;
-
-    get_config_dir(dir, MAX_PATH);
-    _snwprintf_s(path, MAX_PATH, MAX_PATH - 1, L"%s\\targets.ini", dir);
-    f = _wfopen(path, L"rb");
-    if (!f) return;
-    {
-        int section = 0;
-        while (fgets(buf, sizeof(buf), f)) {
-            wchar_t line[1024];
-            int n = MultiByteToWideChar(CP_UTF8, 0, buf, -1, line, 1024);
-            if (n <= 0) continue;
-            {
-                size_t l = wcslen(line);
-                while (l > 0 && (line[l-1] == L'\n' || line[l-1] == L'\r')) line[--l] = L'\0';
-            }
-            if (line[0] == L'[') {
-                section = (_wcsicmp(line, L"[openin]") == 0) ? 1 :
-                          (_wcsicmp(line, L"[targets]") == 0) ? 2 : 0;
-                continue;
-            }
-            if (section == 1) {
-                if (_wcsnicmp(line, L"install_dir=", 12) == 0)
-                    wcscpy_s(g_installDir, MAX_PATH, line + 12);
-                else if (_wcsnicmp(line, L"added_path=", 11) == 0)
-                    g_addedPath = _wtoi(line + 11);
-                else if (_wcsnicmp(line, L"created_dir=", 12) == 0)
-                    g_createdDir = _wtoi(line + 12);
-            } else if (section == 2 && g_targetCount < MAX_TARGETS) {
-                wchar_t *eq = wcschr(line, L'=');
-                if (eq && eq > line) {
-                    *eq = L'\0';
-                    wcscpy_s(g_targets[g_targetCount].name, 64, line);
-                    wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, eq + 1);
-                    g_targetCount++;
-                }
-            }
-        }
-        fclose(f);
-    }
-}
-
-static void save_config(void)
-{
-    wchar_t dir[MAX_PATH], path[MAX_PATH];
-    wchar_t *buf;
-    char *u8;
-    int n, pos = 0;
-    FILE *f;
-    enum { CAP = 40000 };
-
-    get_config_dir(dir, MAX_PATH);
-    CreateDirectoryW(dir, NULL);
-    _snwprintf_s(path, MAX_PATH, MAX_PATH - 1, L"%s\\targets.ini", dir);
-
-    buf = (wchar_t *)malloc(CAP * sizeof(wchar_t));
-    if (!buf) return;
-    pos += _snwprintf_s(buf + pos, CAP - pos, CAP - pos - 1,
-                        L"[openin]\r\ninstall_dir=%s\r\nadded_path=%d\r\ncreated_dir=%d\r\n",
-                        g_installDir[0] ? g_installDir : L"", g_addedPath, g_createdDir);
-    if (g_targetCount > 0) {
-        pos += _snwprintf_s(buf + pos, CAP - pos, CAP - pos - 1, L"[targets]\r\n");
-        for (int i = 0; i < g_targetCount && pos < CAP - 600; i++)
-            pos += _snwprintf_s(buf + pos, CAP - pos, CAP - pos - 1,
-                                L"%s=%s\r\n", g_targets[i].name, g_targets[i].exePath);
-    }
-
-    n = WideCharToMultiByte(CP_UTF8, 0, buf, pos, NULL, 0, NULL, NULL);
-    if (n > 0) {
-        u8 = (char *)malloc((size_t)n + 1);
-        if (u8) {
-            WideCharToMultiByte(CP_UTF8, 0, buf, pos, u8, n, NULL, NULL);
-            u8[n] = '\0';
-            f = _wfopen(path, L"wb");
-            if (f) { fwrite(u8, 1, (size_t)n, f); fclose(f); }
-            free(u8);
-        }
-    }
-    free(buf);
-}
 
 static int find_target(const wchar_t *name)
 {
@@ -875,13 +684,7 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     if (outAddedPath) *outAddedPath = 0;
 
     /* 确保安装目录存在(-p 可能指向尚未创建的目录) */
-    {
-        DWORD a = GetFileAttributesW(installDir);
-        if (a == INVALID_FILE_ATTRIBUTES)
-            g_createdDir = CreateDirectoryW(installDir, NULL) ? 1 : 0;
-        else
-            g_createdDir = 0;   /* 目录原本已存在 */
-    }
+    CreateDirectoryW(installDir, NULL);
 
     _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
     _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", installDir, name);
@@ -963,7 +766,7 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     return 0;
 }
 
-/* 卸载目标: 删除 launcher 文件;若 openin 曾加入 PATH 且目录已空,移除 PATH 条目 */
+/* 卸载目标: 只删除 launcher 文件,不做其他任何改动 */
 static int uninstall_target(const wchar_t *name, const wchar_t *installDir,
                             wchar_t *outSummary, size_t sumSz)
 {
@@ -978,37 +781,6 @@ static int uninstall_target(const wchar_t *name, const wchar_t *installDir,
     if (!any) {
         _snwprintf_s(outSummary, sumSz, sumSz - 1, L"\"%s\" 尚未安装,无需卸载。", name);
         return 1;
-    }
-
-    /* PATH / 目录清理: openin 曾加入 或 曾创建 且 目录已空 → 还原 */
-    {
-        BOOL empty = TRUE;
-        if (g_addedPath || g_createdDir) {
-            wchar_t pat[MAX_PATH];
-            WIN32_FIND_DATAW fd;
-            HANDLE hf;
-            _snwprintf_s(pat, MAX_PATH, MAX_PATH - 1, L"%s\\*", installDir);
-            hf = FindFirstFileW(pat, &fd);
-            if (hf != INVALID_HANDLE_VALUE) {
-                do {
-                    if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
-                        empty = FALSE;
-                        break;
-                    }
-                } while (FindNextFileW(hf, &fd));
-                FindClose(hf);
-            }
-        }
-        if (empty) {
-            if (g_addedPath) {
-                remove_from_user_path(installDir);
-                g_addedPath = 0;
-            }
-            if (g_createdDir) {
-                RemoveDirectoryW(installDir);
-                g_createdDir = 0;
-            }
-        }
     }
 
     _snwprintf_s(outSummary, sumSz, sumSz - 1, L"已卸载 \"%s\"。", name);
@@ -1152,7 +924,6 @@ enum {
     IDC_ROW_REMOVE = 800,
     IDM_ADD = 401,
     IDM_UNINSTALL = 402,
-    IDM_CONFIG = 404,
     IDM_ABOUT = 405,
     IDC_AD_NAME = 200,
     IDC_AD_PATH = 201,
@@ -1405,7 +1176,7 @@ static void browse_row(int row)
 static void install_row(int row)
 {
     wchar_t name[64], path[MAX_PATH], codeExe[MAX_PATH], buf[4096];
-    int addedPath = 0, tidx;
+    int tidx;
     DWORD attrs;
 
     g_activeRow = row;
@@ -1431,8 +1202,7 @@ static void install_row(int row)
     SetCursor(LoadCursor(NULL, IDC_WAIT));
     if (install_target(name, codeExe,
                        (row < preset_count()) ? PRESETS[row].cli : 0,
-                       g_installDir, buf, 4096, &addedPath) == 0) {
-        g_addedPath = addedPath;
+                       g_installDir, buf, 4096, NULL) == 0) {
         tidx = find_target(name);
         if (tidx >= 0)
             wcscpy_s(g_targets[tidx].exePath, MAX_PATH, codeExe);
@@ -1441,7 +1211,6 @@ static void install_row(int row)
             wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, codeExe);
             g_targetCount++;
         }
-        save_config();
         SetWindowTextW(g_edit[row], codeExe);
     }
     SetWindowTextW(g_hStatus, buf);
@@ -1455,10 +1224,8 @@ static void uninstall_row(int row)
 
     g_activeRow = row;
     if (!row_to_name(row, name, 64)) return;
-    if (uninstall_target(name, g_installDir, buf, 1024) == 0) {
+    if (uninstall_target(name, g_installDir, buf, 1024) == 0)
         remove_target_entry(name);
-        save_config();
-    }
     SetWindowTextW(g_hStatus, buf);
     update_status(row);
 }
@@ -1470,7 +1237,6 @@ static void remove_custom_row(int row)
     g_activeRow = row;
     if (!row_to_name(row, name, 64)) return;
     remove_target_entry(name);
-    save_config();
     _snwprintf_s(buf, 256, 255, L"已移除自定义目标 \"%s\"(已安装的命令不受影响)。", name);
     SetWindowTextW(g_hStatus, buf);
     refresh_rows(g_hMain);
@@ -1482,14 +1248,6 @@ static void re_detect_all(void)
     for (i = 0; i < g_rowCount; i++)
         if (i < preset_count()) fill_path(i);
     SetWindowTextW(g_hStatus, L"已重新自动检索路径。");
-}
-
-static void open_config_dir(void)
-{
-    wchar_t dir[MAX_PATH];
-    get_config_dir(dir, MAX_PATH);
-    CreateDirectoryW(dir, NULL);
-    ShellExecuteW(NULL, L"open", dir, NULL, NULL, SW_SHOWNORMAL);
 }
 
 /* ---------- 添加自定义对话框(非核心) ---------- */
@@ -1633,7 +1391,6 @@ static void show_adv_menu(HWND h)
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_ADD, L"添加自定义…");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, IDM_CONFIG, L"打开配置目录");
     AppendMenuW(m, MF_STRING, IDM_ABOUT, L"关于");
 
     GetWindowRect(g_hAdv, &rc);
@@ -1681,13 +1438,12 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         case IDC_REDETECT: re_detect_all(); return 0;
         case IDC_ADV: show_adv_menu(h); return 0;
         case IDM_ADD:
-            if (add_custom_dialog(h)) { save_config(); refresh_rows(h); }
+            if (add_custom_dialog(h)) refresh_rows(h);
             return 0;
         case IDM_UNINSTALL:
             if (g_activeRow >= 0) uninstall_row(g_activeRow);
             else SetWindowTextW(g_hStatus, L"请先在某一行点击浏览或安装。");
             return 0;
-        case IDM_CONFIG: open_config_dir(); return 0;
         case IDM_ABOUT:
             MessageBoxW(h, L"openin — 通用「打开到应用」启动器安装器\n\n"
                           L"把应用注入地址栏: 输入命令,以当前文件夹为参数打开。",
@@ -1709,9 +1465,7 @@ static int gui_main(void)
     HWND hwnd;
     MSG msg;
 
-    load_config();
-    if (!g_installDir[0])
-        pick_target_dir(NULL, g_installDir, MAX_PATH);
+    pick_target_dir(NULL, g_installDir, MAX_PATH);   /* 无状态: 每次自动选择安装目录 */
 
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = main_wnd_proc;
@@ -1746,14 +1500,11 @@ int wmain(int argc, wchar_t *argv[])
     wchar_t installDir[MAX_PATH];
     wchar_t buf[4096];
     wchar_t targetOverride[MAX_PATH];
-    wchar_t localApp[MAX_PATH];
-    int quiet = 0, i, addedPath = 0, rc, uninstallMode = 0;
+    int quiet = 0, i, rc, uninstallMode = 0;
 
     if (argc <= 1) {
         return gui_main();                       /* 双击/无参数 → GUI */
     }
-
-    load_config();                               /* 与 GUI 共享配置 */
 
     /* 解析参数 */
     wcscpy_s(name, 64, L"vscode");
@@ -1783,24 +1534,15 @@ int wmain(int argc, wchar_t *argv[])
                  MB_OK | MB_ICONWARNING);
     }
     g_quiet = quiet;
-    if (quiet) {
-        if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL,
-                             SHGFP_TYPE_CURRENT, localApp) == S_OK) {
-            _snwprintf_s(g_logpath, MAX_PATH, MAX_PATH - 1,
-                         L"%s\\openin.log", localApp);
-            DeleteFileW(g_logpath);
-            g_logfile = g_logpath;
-        }
-    }
 
     /* 卸载模式 */
     if (uninstallMode) {
         wchar_t ubuf[1024];
-        int urc = uninstall_target(name, g_installDir, ubuf, 1024);
-        if (urc == 0) {
+        wchar_t udir[MAX_PATH];
+        pick_target_dir(targetOverride, udir, MAX_PATH);   /* 启动器在自动选择的目录 */
+        int urc = uninstall_target(name, udir, ubuf, 1024);
+        if (urc == 0)
             remove_target_entry(name);
-            save_config();
-        }
         show(L"openin", ubuf, urc == 0 ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONERROR);
         return urc;
     }
@@ -1831,12 +1573,10 @@ int wmain(int argc, wchar_t *argv[])
         int cli = 0;
         for (i = 0; i < preset_count(); i++)
             if (_wcsicmp(PRESETS[i].name, name) == 0) { cli = PRESETS[i].cli; break; }
-        rc = install_target(name, codeExe, cli, installDir, buf, 4096, &addedPath);
+        rc = install_target(name, codeExe, cli, installDir, buf, 4096, NULL);
     }
     if (rc == 0) {
-        /* 持久化,便于 GUI 识别状态 */
-        wcscpy_s(g_installDir, MAX_PATH, installDir);
-        g_addedPath = addedPath;
+        /* 仅在会话内存记录目标,不落盘 */
         {
             int tidx = find_target(name);
             if (tidx >= 0)
@@ -1847,7 +1587,6 @@ int wmain(int argc, wchar_t *argv[])
                 g_targetCount++;
             }
         }
-        save_config();
         show(L"openin", buf, MB_OK | MB_ICONINFORMATION);
     } else {
         show(L"openin", buf, MB_OK | MB_ICONERROR);
