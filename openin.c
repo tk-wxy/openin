@@ -33,7 +33,11 @@
 #include <wchar.h>
 #include <string.h>
 
+#include "launcher_templates.h"
+
 static int g_quiet = 0;
+static int g_scrollY = 0;
+
 
 /* ---------- 输出(静默模式下不弹窗、不产生任何文件) ---------- */
 static void show(const wchar_t *title, const wchar_t *text, UINT flags)
@@ -358,6 +362,48 @@ static BOOL run_gcc(const wchar_t *cmdline, const wchar_t *logPath,
             CloseHandle(h);
         }
     }
+    return ok;
+}
+
+/* ---------- 预编译二进制 Patch Launcher (免 GCC 模式) ---------- */
+static BOOL write_launcher_binary(const wchar_t *codeExe, int cli, const wchar_t *outExePath)
+{
+    const unsigned char *tmpl = cli ? g_launcher_cli_exe : g_launcher_gui_exe;
+    size_t tmpl_len = cli ? g_launcher_cli_exe_len : g_launcher_gui_exe_len;
+
+    static const wchar_t magic[] = L"__OPENIN_TARGET_EXE_MAGIC";
+    size_t magic_bytes_len = wcslen(magic) * sizeof(wchar_t);
+
+    long found_offset = -1;
+    for (size_t i = 0; i <= tmpl_len - magic_bytes_len; i++) {
+        if (memcmp(tmpl + i, magic, magic_bytes_len) == 0) {
+            found_offset = (long)i;
+            break;
+        }
+    }
+
+    if (found_offset < 0) return FALSE;
+
+    unsigned char *buf = (unsigned char *)malloc(tmpl_len);
+    if (!buf) return FALSE;
+    memcpy(buf, tmpl, tmpl_len);
+
+    wchar_t target_buf[1024];
+    ZeroMemory(target_buf, sizeof(target_buf));
+    wcscpy_s(target_buf, 1024, codeExe);
+
+    memcpy(buf + found_offset, target_buf, sizeof(target_buf));
+
+    HANDLE h = CreateFileW(outExePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        free(buf);
+        return FALSE;
+    }
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, buf, (DWORD)tmpl_len, &written, NULL) && (written == (DWORD)tmpl_len);
+    CloseHandle(h);
+    free(buf);
     return ok;
 }
 
@@ -699,8 +745,12 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
         return 1;
     }
 
-    /* 有 gcc 则编译 .exe(可选) */
-    if (find_in_path(L"gcc.exe", gccPath, MAX_PATH)) {
+    /* 1. 优先使用预编译二进制 Patch 模板生成 .exe (免 GCC 模式, 毫秒级完成, 无环境依赖) */
+    if (write_launcher_binary(codeExe, cli, exePath)) {
+        exeBuilt = 1;
+    }
+    /* 2. 备用: 若二进制 Patch 失败且系统存在 gcc, 则降级使用 gcc 动态编译 */
+    else if (find_in_path(L"gcc.exe", gccPath, MAX_PATH)) {
         if (write_launcher_source(codeExe, name, cli, srcPath)) {
             _snwprintf_s(cmdline, 1024, 1023,
                          L"gcc -O2 -s -municode -mwindows -o \"%s\" \"%s\"", exePath, srcPath);
@@ -795,9 +845,24 @@ typedef struct {
     int cli;                 /* 1 = 命令行工具: 继承 cwd,不传目录参数 */
 } Preset;
 static const Preset PRESETS[] = {
-    { L"vscode", L"Code.exe", L"VS Code", 0 },
-    { L"codex", L"codex.cmd", L"Codex", 1 },
-    /* 后续在此追加: cursor/Cursor.exe, claude/claude.exe ... */
+    { L"vscode",   L"Code.exe",          L"VS Code",         0 },
+    { L"cursor",   L"Cursor.exe",        L"Cursor",          0 },
+    { L"windsurf", L"Windsurf.exe",      L"Windsurf",        0 },
+    { L"zed",      L"zed.exe",           L"Zed Editor",      0 },
+    { L"sublime",  L"sublime_text.exe",  L"Sublime Text",    0 },
+    { L"idea",     L"idea64.exe",        L"IntelliJ IDEA",   0 },
+    { L"pycharm",  L"pycharm64.exe",     L"PyCharm",         0 },
+    { L"webstorm", L"webstorm64.exe",    L"WebStorm",        0 },
+    { L"clion",    L"clion64.exe",       L"CLion",           0 },
+    { L"goland",   L"goland64.exe",      L"GoLand",          0 },
+    { L"rider",    L"rider64.exe",       L"Rider",           0 },
+    { L"datagrip", L"datagrip64.exe",    L"DataGrip",        0 },
+    { L"rustrover",L"rustrover64.exe",   L"RustRover",       0 },
+    { L"fleet",    L"Fleet.exe",         L"JetBrains Fleet", 0 },
+    { L"neovide",  L"neovide.exe",       L"Neovide",         0 },
+    { L"wt",       L"wt.exe",            L"Windows Terminal",0 },
+    { L"claude",   L"claude.exe",        L"Claude Code",     1 },
+    { L"codex",    L"codex.cmd",         L"Codex",           1 },
 };
 
 /* ---------- GUI ---------- */
@@ -857,7 +922,8 @@ static BOOL scan_root_shallow(const wchar_t *root, const wchar_t *exeName, wchar
 }
 
 /* 自动检索主程序完整路径;成功返回 TRUE */
-static BOOL detect_app(const wchar_t *exeName, wchar_t *out, size_t out_sz)
+/* fromFallback=1 时不再做 .exe<->.cmd 扩展名回退,避免两两互检导致无限递归 */
+static BOOL detect_app_impl(const wchar_t *exeName, wchar_t *out, size_t out_sz, int fromFallback)
 {
     wchar_t root[MAX_PATH], buf[MAX_PATH];
     DWORD len, drives;
@@ -911,7 +977,28 @@ static BOOL detect_app(const wchar_t *exeName, wchar_t *out, size_t out_sz)
             }
         }
     }
+    /* 4. 扩展名回退策略 (.exe <-> .cmd): 只允许回退一层,防止无限递归 */
+    if (!out[0] && !fromFallback) {
+        wchar_t altName[MAX_PATH];
+        wcscpy_s(altName, MAX_PATH, exeName);
+        wchar_t *dot = wcsrchr(altName, L'.');
+        if (dot) {
+            if (_wcsicmp(dot, L".exe") == 0) {
+                wcscpy_s(dot, 5, L".cmd");
+                detect_app_impl(altName, out, out_sz, 1);
+            } else if (_wcsicmp(dot, L".cmd") == 0) {
+                wcscpy_s(dot, 5, L".exe");
+                detect_app_impl(altName, out, out_sz, 1);
+            }
+        }
+    }
     return out[0] != L'\0';
+}
+
+/* 对外接口: 以 exeName 检索,必要时回退到另一扩展名(仅一层) */
+static BOOL detect_app(const wchar_t *exeName, wchar_t *out, size_t out_sz)
+{
+    return detect_app_impl(exeName, out, out_sz, 0);
 }
 
 enum {
@@ -1104,6 +1191,24 @@ static void update_status(int row)
     SetWindowTextW(g_install[row], is_installed(name) ? L"更新" : L"安装");
 }
 
+static void update_scrollbar(HWND h)
+{
+    RECT rc;
+    GetClientRect(h, &rc);
+    int totalH = 36 + g_rowCount * 62 + 40;
+    int clientH = rc.bottom - rc.top;
+
+    SCROLLINFO si;
+    ZeroMemory(&si, sizeof(si));
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = totalH;
+    si.nPage = (UINT)(clientH > 0 ? clientH : 1);
+    si.nPos = g_scrollY;
+    SetScrollInfo(h, SB_VERT, &si, TRUE);
+}
+
 static void layout_controls(HWND h)
 {
     RECT rc;
@@ -1115,10 +1220,10 @@ static void layout_controls(HWND h)
     yBottom = rc.bottom - m - 26;
 
     if (g_hHeader)
-        MoveWindow(g_hHeader, m, 8, w - 2 * m, 20, TRUE);
+        MoveWindow(g_hHeader, m, 8 - g_scrollY, w - 2 * m, 20, TRUE);
 
     for (i = 0; i < g_rowCount; i++) {
-        int y = top + i * rowH;
+        int y = top + i * rowH - g_scrollY;
         if (g_name[i]) MoveWindow(g_name[i], m, y + 2, 120, 20, TRUE);
         if (g_edit[i]) MoveWindow(g_edit[i], 135, y, w - 135 - 225, 22, TRUE);
         if (g_browse[i]) MoveWindow(g_browse[i], w - 225, y - 2, 60, 24, TRUE);
@@ -1130,6 +1235,8 @@ static void layout_controls(HWND h)
     if (g_hRedetect) MoveWindow(g_hRedetect, m, yBottom, 90, 26, TRUE);
     if (g_hAdv) MoveWindow(g_hAdv, 108, yBottom, 70, 26, TRUE);
     if (g_hStatus) MoveWindow(g_hStatus, 188, yBottom, w - 198, 26, TRUE);
+
+    update_scrollbar(h);
 }
 
 static void refresh_rows(HWND h)
@@ -1421,6 +1528,48 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_SIZE:
         layout_controls(h);
         return 0;
+    case WM_VSCROLL: {
+        SCROLLINFO si;
+        ZeroMemory(&si, sizeof(si));
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(h, SB_VERT, &si);
+        int oldPos = si.nPos;
+        switch (LOWORD(w)) {
+        case SB_LINEUP: si.nPos -= 20; break;
+        case SB_LINEDOWN: si.nPos += 20; break;
+        case SB_PAGEUP: si.nPos -= si.nPage; break;
+        case SB_PAGEDOWN: si.nPos += si.nPage; break;
+        case SB_THUMBTRACK: si.nPos = si.nTrackPos; break;
+        }
+        si.fMask = SIF_POS;
+        SetScrollInfo(h, SB_VERT, &si, TRUE);
+        GetScrollInfo(h, SB_VERT, &si);
+        if (si.nPos != oldPos) {
+            g_scrollY = si.nPos;
+            layout_controls(h);
+            InvalidateRect(h, NULL, TRUE);
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        int zDelta = GET_WHEEL_DELTA_WPARAM(w);
+        SCROLLINFO si;
+        ZeroMemory(&si, sizeof(si));
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_POS;
+        GetScrollInfo(h, SB_VERT, &si);
+        int oldPos = si.nPos;
+        si.nPos -= (zDelta / WHEEL_DELTA) * 40;
+        SetScrollInfo(h, SB_VERT, &si, TRUE);
+        GetScrollInfo(h, SB_VERT, &si);
+        if (si.nPos != oldPos) {
+            g_scrollY = si.nPos;
+            layout_controls(h);
+            InvalidateRect(h, NULL, TRUE);
+        }
+        return 0;
+    }
     case WM_COMMAND:
         if (LOWORD(w) >= IDC_ROW_BROWSE && LOWORD(w) < IDC_ROW_BROWSE + g_rowCount) {
             browse_row(LOWORD(w) - IDC_ROW_BROWSE);
@@ -1477,8 +1626,8 @@ static int gui_main(void)
     RegisterClassW(&wc);
 
     hwnd = CreateWindowExW(0, g_winClass, L"openin — 打开到应用",
-                           WS_OVERLAPPEDWINDOW,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 700, 420,
+                           WS_OVERLAPPEDWINDOW | WS_VSCROLL,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 720, 520,
                            NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) return 1;
     ShowWindow(hwnd, SW_SHOW);
@@ -1552,8 +1701,11 @@ int wmain(int argc, wchar_t *argv[])
         if (!browse_for_folder(folder, MAX_PATH)) return 0;
     }
 
-    /* 定位主程序(默认预设 vscode/Code.exe) */
-    {
+    /* 定位主程序: 若 -d 直接传入 exe/cmd 文件则直接使用, 否则在目录中定位 */
+    DWORD attrs = GetFileAttributesW(folder);
+    if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        wcscpy_s(codeExe, MAX_PATH, folder);
+    } else {
         const wchar_t *exeName = L"Code.exe";
         for (i = 0; i < preset_count(); i++)
             if (_wcsicmp(PRESETS[i].name, name) == 0) { exeName = PRESETS[i].exeName; break; }
