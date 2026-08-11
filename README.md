@@ -53,7 +53,7 @@ gcc -O2 -s -municode -mwindows -o openin.exe openin.c -lshell32 -lole32 -lcomdlg
 |---|---|
 | `-municode` | 使用 `wmain` 宽字符入口，正确处理中文 / Unicode 路径 |
 | `-mwindows` | GUI 子系统，运行时不弹出黑框 |
-| `-O2 -s` | 优化并去符号瘦身（产物约 51 KB） |
+| `-O2 -s` | 优化并去符号瘦身（产物约 101 KB） |
 | `-lshell32 -lole32` | 文件夹选择对话框与 COM 所需系统库 |
 | `-lcomdlg32` | 文件选择对话框（GetOpenFileName） |
 
@@ -76,18 +76,20 @@ PATH 中，因此多数情况**无需修改 PATH**）：
 - 所选目录**已在 PATH** → 不改动任何环境变量，仅放入文件
 - 所选目录**不在 PATH**（如自定义 `-p`）→ 自动追加到**用户** PATH（HKCU，无需管理员权限）
 
-生成的产物直接落在该目录：`<name>.exe`（有 gcc 时）与 `<name>.cmd`（始终）。
+生成的产物直接落在该目录：`<name>.exe`（始终，见下节）与 `<name>.cmd`（始终）。
 源码与编译日志走临时目录、用完即删，**目标目录零残留**。
 
 ## 双保险（冗余）机制
 
-每次安装**始终生成** `<name>.cmd` 批处理备用启动器（无需编译器）；若检测到 `gcc`，
-**额外编译** `<name>.exe`（优先使用）。
+每次安装**始终生成** `<name>.cmd` 批处理备用启动器（无需编译器），
+并**始终生成** `<name>.exe`：核心是**免编译器**的「二进制 Patch」——程序内置预编译好的
+launcher 模板（约 22 KB），把其中预留的路径占位符原地替换为目标应用路径，毫秒级完成，
+任何机器都能用。仅当 Patch 意外失败且系统装有 `gcc` 时，才降级为源码编译生成 `.exe`。
 
-| 环境 | 生成物 | 终端输入 | 地址栏输入 |
+| 生成物 | 生成方式 | 终端输入 | 地址栏输入 |
 |---|---|---|---|
-| 有 gcc | `.exe` + `.cmd` | `vscode`（PATHEXT 优先 exe） | `vscode` 或 `vscode.cmd` |
-| 无 gcc | 仅 `.cmd` | `vscode` | `vscode.cmd`（地址栏不解析 PATHEXT，需带扩展名） |
+| `<name>.exe` | 二进制 Patch（免 gcc）；失败且有 gcc 时源码编译 | `vscode`（PATHEXT 优先 exe） | `vscode` 或 `vscode.cmd` |
+| `<name>.cmd` | 始终生成（纯批处理兜底） | `vscode` | `vscode.cmd`（地址栏不解析 PATHEXT，需带扩展名） |
 
 > `.cmd` 按系统 ANSI 代码页（中文系统为 GBK）写入，含中文的路径也能被 cmd 正确解析。
 > 若应用路径含 `% ^ &` 字符，批处理内会自动转义。
@@ -102,30 +104,29 @@ PATH 中，因此多数情况**无需修改 PATH**）：
 
 - 一个工具注入任意应用，每个应用一个独立命令，互不冲突
 - 安装在通用用户 bin 目录，已在 PATH 则完全不动环境变量，卸载只删几个文件
-- 冗余：有 gcc 用 exe，无 gcc 退化为 cmd，`<name>.cmd` 永远可用
+- 冗余：`.exe` 免编译器生成（二进制 Patch），`.cmd` 永远兜底
 - 幂等：重复安装会覆盖同名文件，不产生重复 PATH 条目
 - 冲突检测：同时检查 PATH 中是否已有同名 `.exe` / `.cmd`，有则提示优先解析到的位置
 - 兼容选中 `bin` 子目录：自动向上找到上级的主程序（如 `Code.exe`）
 - 支持参数透传：`vscode . -r`（复用窗口）、`vscode D:\some\file.txt`
-- 两类预设：**GUI 应用**（vscode，传目录参数）与**命令行工具**（codex，继承 cwd、不传目录参数、经 ShellExecute 启动 .cmd）
+- 两类预设：**GUI 应用**（vscode，传目录参数）与**命令行工具**（codex，继承 cwd、不传目录参数、经 Windows Terminal 打开可见终端运行）
 
 ## 路线图
 
 - [x] VS Code 支持（首个应用）
-- [x] 预设应用模板（vscode、codex 内置；cursor/claude 待加）
+- [x] 预设应用模板（18 个：16 GUI + 2 CLI）
 - [x] 图形界面管理：多目标列表、安装/更新、卸载、添加自定义、移除、刷新
-- [ ] 无 gcc 环境默认分发预编译 launcher
+- [x] 无 gcc 环境默认分发预编译 launcher（二进制 Patch）
 - [ ] 系统托盘常驻 / 开机自启动
 
 ## 故障排查
 
-- **无 gcc**：自动退化为 `.cmd` 模式，功能不受影响；想用 exe 可装 MinGW-w64
-  （`winget install BrechtSanders.WinLibs.POSIX.UCRT`）后重新运行
+- **无 gcc**：`<name>.exe` 由内置模板二进制 Patch 生成，无需编译器；仅 Patch 失败且无 gcc 时才退化为纯 `.cmd` 模式
 - **编译失败**：不影响使用，会保留 `.cmd` 备用并给出 gcc 输出
 - **换个应用/路径**：重新运行选择新目录即可（会重新生成文件，PATH 通常不用动）
 - **新窗口不生效**：已打开的终端/资源管理器需重启；Explorer 会自动刷新（WM_SETTINGCHANGE）
 
 ## 依赖
 
-- **gcc 可选**：仅在需要编译 `.exe` 时使用（MinGW-w64）；无 gcc 也能工作（.cmd 模式）
+- **gcc 可选**：仅作为二进制 Patch 失败时的兜底编译手段（MinGW-w64）；无 gcc 也能正常工作
 - openin 本身是预编译 exe，运行它不需要任何编译器
