@@ -76,21 +76,54 @@ PATH 中，因此多数情况**无需修改 PATH**）：
 - 所选目录**已在 PATH** → 不改动任何环境变量，仅放入文件
 - 所选目录**不在 PATH**（如自定义 `-p`）→ 自动追加到**用户** PATH（HKCU，无需管理员权限）
 
-生成的产物直接落在该目录：`<name>.exe`（有 gcc 时）与 `<name>.cmd`（始终）。
+生成的产物直接落在该目录：`<name>.exe`（二进制 Patch，无需 gcc）与 `<name>.cmd`（始终）。
 源码与编译日志走临时目录、用完即删，**目标目录零残留**。
 
 ## 双保险（冗余）机制
 
-每次安装**始终生成** `<name>.cmd` 批处理备用启动器（无需编译器）；若检测到 `gcc`，
-**额外编译** `<name>.exe`（优先使用）。
+每次安装**始终生成** `<name>.cmd` 批处理备用启动器（无需编译器）；`<name>.exe` 默认通过
+**二进制 Patch** 预编译模板生成（毫秒级、无需 gcc），仅当 Patch 失败且系统有 gcc 时才降级编译。
 
-| 环境 | 生成物 | 终端输入 | 地址栏输入 |
+| 情况 | 生成物 | 终端输入 | 地址栏输入 |
 |---|---|---|---|
-| 有 gcc | `.exe` + `.cmd` | `vscode`（PATHEXT 优先 exe） | `vscode` 或 `vscode.cmd` |
-| 无 gcc | 仅 `.cmd` | `vscode` | `vscode.cmd`（地址栏不解析 PATHEXT，需带扩展名） |
+| 默认（二进制 Patch） | `.exe` + `.cmd` | `vscode`（PATHEXT 优先 exe） | `vscode` 或 `vscode.cmd` |
+| Patch 失败且无 gcc | 仅 `.cmd` | `vscode` | `vscode.cmd`（地址栏不解析 PATHEXT，需带扩展名） |
 
 > `.cmd` 按系统 ANSI 代码页（中文系统为 GBK）写入，含中文的路径也能被 cmd 正确解析。
 > 若应用路径含 `% ^ &` 字符，批处理内会自动转义。
+
+## 技术实现
+
+**原理**：地址栏 / 终端按 PATH 查找命令，并以「当前文件夹」作为子进程工作目录（CWD）启动。
+openin 装进去的不是应用本身，而是一个**跳板**（launcher）：读取 CWD 后作为参数启动真正的应用，
+于是「站在哪个文件夹就 `vscode`，哪个文件夹被打开」。
+
+**Launcher 生成（双冗余）**：
+
+- `<name>.exe`：默认**二进制 Patch** —— 内置预编译模板（源见 `scratch/launcher_gui.c`、
+  `scratch/launcher_cli.c`，用 `scratch/bin2h.c` 转成字节数组写进 `launcher_templates.h`），
+  把模板 `.data` 段里的 `__OPENIN_TARGET_EXE_MAGIC` 占位符原地替换为目标 exe 路径，毫秒级、免 gcc；
+  仅当 Patch 失败且系统有 gcc 时降级为源码编译
+- `<name>.cmd`：始终生成（GBK/ANSI 写出，自动转义 `% ^ &`），免编译器兜底
+
+**两类模板**（`cli` 标志区分）：
+
+- **GUI 应用**（vscode / cursor…）：把 CWD 或命令行参数作为「目录参数」传给应用（`DETACHED_PROCESS`）
+- **命令行工具**（claude / codex…）：不传目录参数，原地打开可见终端并继承 CWD
+  （`cmd /c start "" wt.exe -d <CWD> cmd /k <shim>.cmd`，回退 `cmd /c` + `CREATE_NEW_CONSOLE`）
+
+**PATH**：所选安装目录已在 PATH 则完全不动；否则追加到用户 PATH（HKCU，免管理员）并广播
+`WM_SETTINGCHANGE` 让 Explorer 刷新。
+
+**无状态**：只创建 launcher 文件，不写任何配置 / 日志；临时编译源码与日志用完即删；自定义目标仅存
+会话内存，关闭即失。
+
+**GUI 后台自动检索**：窗口先秒开，18 个预设路径由后台线程逐个扫描（PATH → `%LOCALAPPDATA%\Programs`
+等根目录深 2 层 → 各盘符根一层 → `.exe`⇄`.cmd` 回退一层），经 `WM_APP_DETECT` 消息回填，
+仅在编辑框为空时写入，不覆盖用户输入。
+
+**已知问题**：命令行工具从地址栏启动时，前台焦点不可靠（Windows 前台锁 + Windows Terminal 不抢焦点），
+详见 `CLAUDE.md`。
 
 ## 卸载
 
@@ -102,30 +135,29 @@ PATH 中，因此多数情况**无需修改 PATH**）：
 
 - 一个工具注入任意应用，每个应用一个独立命令，互不冲突
 - 安装在通用用户 bin 目录，已在 PATH 则完全不动环境变量，卸载只删几个文件
-- 冗余：有 gcc 用 exe，无 gcc 退化为 cmd，`<name>.cmd` 永远可用
+- 冗余：exe 默认二进制 Patch 生成（无需 gcc），`<name>.cmd` 永远可用
 - 幂等：重复安装会覆盖同名文件，不产生重复 PATH 条目
 - 冲突检测：同时检查 PATH 中是否已有同名 `.exe` / `.cmd`，有则提示优先解析到的位置
 - 兼容选中 `bin` 子目录：自动向上找到上级的主程序（如 `Code.exe`）
 - 支持参数透传：`vscode . -r`（复用窗口）、`vscode D:\some\file.txt`
-- 两类预设：**GUI 应用**（vscode，传目录参数）与**命令行工具**（codex，继承 cwd、不传目录参数、经 ShellExecute 启动 .cmd）
+- 两类预设：**GUI 应用**（vscode，传目录参数）与**命令行工具**（codex，继承 cwd、不传目录参数、经 `cmd /c start` 在 Windows Terminal 中打开）
 
 ## 路线图
 
 - [x] VS Code 支持（首个应用）
-- [x] 预设应用模板（vscode、codex 内置；cursor/claude 待加）
-- [x] 图形界面管理：多目标列表、安装/更新、卸载、添加自定义、移除、刷新
-- [ ] 无 gcc 环境默认分发预编译 launcher
+- [x] 预设应用模板（18 个：vscode、cursor、JetBrains 全家桶、zed、sublime、wt、claude、codex…）
+- [x] 图形界面管理：多目标列表、安装/更新、卸载、添加自定义、移除、刷新、后台自动检索
+- [x] 无 gcc 环境默认分发预编译 launcher（二进制 Patch）
 - [ ] 系统托盘常驻 / 开机自启动
 
 ## 故障排查
 
-- **无 gcc**：自动退化为 `.cmd` 模式，功能不受影响；想用 exe 可装 MinGW-w64
-  （`winget install BrechtSanders.WinLibs.POSIX.UCRT`）后重新运行
-- **编译失败**：不影响使用，会保留 `.cmd` 备用并给出 gcc 输出
+- **无 gcc**：无需安装——`<name>.exe` 通过内置预编译模板二进制 Patch 生成，不依赖 gcc
+- **Patch / 编译失败**：不影响使用，会保留 `.cmd` 备用并给出错误信息
 - **换个应用/路径**：重新运行选择新目录即可（会重新生成文件，PATH 通常不用动）
 - **新窗口不生效**：已打开的终端/资源管理器需重启；Explorer 会自动刷新（WM_SETTINGCHANGE）
 
 ## 依赖
 
-- **gcc 可选**：仅在需要编译 `.exe` 时使用（MinGW-w64）；无 gcc 也能工作（.cmd 模式）
+- **gcc 可选**：仅在二进制 Patch 生成 `.exe` 失败时才降级使用（MinGW-w64）；默认无 gcc 也能生成 `.exe`
 - openin 本身是预编译 exe，运行它不需要任何编译器
