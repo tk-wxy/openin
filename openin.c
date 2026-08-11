@@ -734,9 +734,15 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
 
     _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
     _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", installDir, name);
-    GetTempPathW(MAX_PATH, tempDir);
-    _snwprintf_s(srcPath, MAX_PATH, MAX_PATH - 1, L"%s%s.c", tempDir, name);
-    _snwprintf_s(logPath, MAX_PATH, MAX_PATH - 1, L"%s%s-build.log", tempDir, name);
+    /* 临时文件放 openin.exe 所在目录(项目目录),用完即删,不碰系统 %TEMP% */
+    if (GetModuleFileNameW(NULL, tempDir, MAX_PATH) > 0) {
+        wchar_t *slash = wcsrchr(tempDir, L'\\');
+        if (slash) *slash = L'\0';
+    } else {
+        wcscpy_s(tempDir, MAX_PATH, L".");
+    }
+    _snwprintf_s(srcPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.c", tempDir, name);
+    _snwprintf_s(logPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s-build.log", tempDir, name);
 
     /* .cmd 备用启动器(无需编译器,始终生成) */
     if (!write_launcher_cmd(codeExe, cli, cmdPath)) {
