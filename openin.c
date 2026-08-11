@@ -1024,6 +1024,10 @@ static int g_activeRow = -1;
 static const wchar_t *g_winClass = L"openin_main";
 static int g_addResult = 0;
 
+#define WM_APP_DETECT (WM_APP + 1)      /* 后台检测线程回填单行路径 */
+static HANDLE g_detectThread = NULL;    /* 后台自动检测线程(仅主线程访问) */
+static volatile LONG g_detectStop = 0;  /* 通知后台线程停止 */
+
 static int preset_count(void) { return (int)(sizeof(PRESETS) / sizeof(PRESETS[0])); }
 
 /* 目标总数 = 预设 + 非预设自定义 */
@@ -1239,15 +1243,53 @@ static void layout_controls(HWND h)
     update_scrollbar(h);
 }
 
+/* ---------- 后台自动检测 ---------- */
+/*
+ * 扫描全部预设主程序路径是较重的磁盘遍历(约 1~2s),放后台线程逐行回填,
+ * 让窗口立即出现;回填只在编辑框仍为空时生效,不覆盖用户已填的内容。
+ */
+static DWORD WINAPI detect_thread_fn(LPVOID param)
+{
+    HWND h = (HWND)param;
+    int n = preset_count();
+
+    for (int row = 0; row < n && !g_detectStop; row++) {
+        wchar_t *path = (wchar_t *)malloc(MAX_PATH * sizeof(wchar_t));
+        if (!path) break;
+        if (detect_app(PRESETS[row].exeName, path, MAX_PATH)) {
+            if (!PostMessageW(h, WM_APP_DETECT, (WPARAM)row, (LPARAM)path))
+                free(path);   /* 窗口已销毁,消息未入队 */
+        } else {
+            free(path);
+        }
+    }
+    return 0;
+}
+
+/* 确保有一个后台检测线程在跑;上一个已结束则重新启动 */
+static void start_auto_detect(HWND h)
+{
+    if (g_detectThread) {
+        if (WaitForSingleObject(g_detectThread, 0) == WAIT_OBJECT_0) {
+            CloseHandle(g_detectThread);
+            g_detectThread = NULL;   /* 上一个线程已结束,可复用 */
+        } else {
+            return;                  /* 仍在跑,复用 */
+        }
+    }
+    InterlockedExchange(&g_detectStop, 0);
+    g_detectThread = CreateThread(NULL, 0, detect_thread_fn, h, 0, NULL);
+    if (!g_detectThread) g_detectThread = NULL;
+}
+
 static void refresh_rows(HWND h)
 {
     int i;
     build_rows(h);
     layout_controls(h);
-    for (i = 0; i < g_rowCount; i++) {
-        fill_path(i);
+    for (i = 0; i < g_rowCount; i++)
         update_status(i);
-    }
+    start_auto_detect(h);   /* 后台逐行回填预设路径,窗口无需等待 */
 }
 
 /* 预设行浏览: 选目录并定位主程序;自定义行: 直接选 exe 文件 */
@@ -1570,6 +1612,16 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         return 0;
     }
+    case WM_APP_DETECT: {
+        int row = (int)w;
+        wchar_t *path = (wchar_t *)l;
+        if (row >= 0 && row < g_rowCount && row < preset_count()
+            && g_edit && g_edit[row]
+            && GetWindowTextLengthW(g_edit[row]) == 0)
+            SetWindowTextW(g_edit[row], path);
+        free(path);
+        return 0;
+    }
     case WM_COMMAND:
         if (LOWORD(w) >= IDC_ROW_BROWSE && LOWORD(w) < IDC_ROW_BROWSE + g_rowCount) {
             browse_row(LOWORD(w) - IDC_ROW_BROWSE);
@@ -1601,6 +1653,12 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         return 0;
     case WM_DESTROY:
+        InterlockedExchange(&g_detectStop, 1);
+        if (g_detectThread) {
+            WaitForSingleObject(g_detectThread, 3000);
+            CloseHandle(g_detectThread);
+            g_detectThread = NULL;
+        }
         destroy_rows();
         PostQuitMessage(0);
         return 0;
