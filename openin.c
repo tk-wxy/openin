@@ -692,7 +692,7 @@ static int valid_name(const wchar_t *s)
 /* ---------- 目标(仅会话内存,不持久化、不产生任何外部文件) ---------- */
 #define MAX_TARGETS 64
 static wchar_t g_installDir[MAX_PATH];   /* 每次运行由 pick_target_dir 计算,不落盘 */
-typedef struct { wchar_t name[64]; wchar_t exePath[MAX_PATH]; } Target;
+typedef struct { wchar_t name[64]; wchar_t exePath[MAX_PATH]; int cli; } Target;
 static Target g_targets[MAX_TARGETS];
 static int g_targetCount = 0;
 
@@ -1014,7 +1014,8 @@ enum {
     IDM_ABOUT = 405,
     IDC_AD_NAME = 200,
     IDC_AD_PATH = 201,
-    IDC_AD_BROWSE = 202
+    IDC_AD_BROWSE = 202,
+    IDC_AD_CLI = 203
 };
 
 static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hStatus;
@@ -1146,8 +1147,10 @@ static void build_rows(HWND h)
             _snwprintf_s(label, 160, 159, L"%s  (%s)", PRESETS[i].display, PRESETS[i].name);
         } else {
             wchar_t nm[64];
+            int k = non_preset_index(i - preset_count());
             row_to_name(i, nm, 64);
-            _snwprintf_s(label, 160, 159, L"%s (自定义)", nm);
+            _snwprintf_s(label, 160, 159, L"%s (自定义%s)",
+                         nm, (k >= 0 && g_targets[k].cli) ? L"·CLI" : L"");
         }
         g_name[i] = CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE,
             0, 0, 120, 20, h, NULL, hi, NULL);
@@ -1289,6 +1292,8 @@ static void refresh_rows(HWND h)
     layout_controls(h);
     for (i = 0; i < g_rowCount; i++)
         update_status(i);
+    for (i = preset_count(); i < g_rowCount; i++)
+        fill_path(i);   /* 自定义行: 从会话记录恢复路径,免二次填写 */
     start_auto_detect(h);   /* 后台逐行回填预设路径,窗口无需等待 */
 }
 
@@ -1349,18 +1354,25 @@ static void install_row(int row)
     }
 
     SetCursor(LoadCursor(NULL, IDC_WAIT));
-    if (install_target(name, codeExe,
-                       (row < preset_count()) ? PRESETS[row].cli : 0,
-                       g_installDir, buf, 4096, NULL) == 0) {
-        tidx = find_target(name);
-        if (tidx >= 0)
-            wcscpy_s(g_targets[tidx].exePath, MAX_PATH, codeExe);
-        else if (g_targetCount < MAX_TARGETS) {
-            wcscpy_s(g_targets[g_targetCount].name, 64, name);
-            wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, codeExe);
-            g_targetCount++;
+    {
+        int cli = (row < preset_count()) ? PRESETS[row].cli : 0;
+        if (row >= preset_count()) {
+            tidx = find_target(name);
+            if (tidx >= 0) cli = g_targets[tidx].cli;
         }
-        SetWindowTextW(g_edit[row], codeExe);
+        if (install_target(name, codeExe, cli, g_installDir, buf, 4096, NULL) == 0) {
+            tidx = find_target(name);
+            if (tidx >= 0) {
+                wcscpy_s(g_targets[tidx].exePath, MAX_PATH, codeExe);
+                g_targets[tidx].cli = cli;
+            } else if (g_targetCount < MAX_TARGETS) {
+                wcscpy_s(g_targets[g_targetCount].name, 64, name);
+                wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, codeExe);
+                g_targets[g_targetCount].cli = cli;
+                g_targetCount++;
+            }
+            SetWindowTextW(g_edit[row], codeExe);
+        }
     }
     SetWindowTextW(g_hStatus, buf);
     SetCursor(LoadCursor(NULL, IDC_ARROW));
@@ -1415,10 +1427,14 @@ static LRESULT CALLBACK add_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             h, (HMENU)IDC_AD_PATH, hi, NULL);
         CreateWindowExW(0, L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
             302, 42, 80, 22, h, (HMENU)IDC_AD_BROWSE, hi, NULL);
+        CreateWindowExW(0, L"BUTTON",
+            L"命令行工具 (CLI: 继承 cwd, 经 Windows Terminal 打开可见终端)",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            12, 74, 390, 22, h, (HMENU)IDC_AD_CLI, hi, NULL);
         CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            170, 96, 80, 28, h, (HMENU)IDOK, hi, NULL);
+            170, 120, 80, 28, h, (HMENU)IDOK, hi, NULL);
         CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            270, 96, 80, 28, h, (HMENU)IDCANCEL, hi, NULL);
+            270, 120, 80, 28, h, (HMENU)IDCANCEL, hi, NULL);
         SetFocus(GetDlgItem(h, IDC_AD_NAME));
         return 0;
     }
@@ -1430,7 +1446,7 @@ static LRESULT CALLBACK add_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             ZeroMemory(&ofn, sizeof(ofn));
             ofn.lStructSize = sizeof(ofn);
             ofn.hwndOwner = h;
-            ofn.lpstrFilter = L"应用程序 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0";
+            ofn.lpstrFilter = L"应用程序 (*.exe;*.cmd)\0*.exe;*.cmd\0所有文件 (*.*)\0*.*\0";
             ofn.lpstrFile = file;
             ofn.nMaxFile = MAX_PATH;
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
@@ -1454,12 +1470,15 @@ static LRESULT CALLBACK add_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
                 return 0;
             }
             {
+                int cli = IsDlgButtonChecked(h, IDC_AD_CLI);
                 int idx = find_target(nm);
-                if (idx >= 0)
+                if (idx >= 0) {
                     wcscpy_s(g_targets[idx].exePath, MAX_PATH, path);
-                else if (g_targetCount < MAX_TARGETS) {
+                    g_targets[idx].cli = cli;
+                } else if (g_targetCount < MAX_TARGETS) {
                     wcscpy_s(g_targets[g_targetCount].name, 64, nm);
                     wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, path);
+                    g_targets[g_targetCount].cli = cli;
                     g_targetCount++;
                 }
             }
@@ -1502,7 +1521,7 @@ static int add_custom_dialog(HWND parent)
 
     h = CreateWindowExW(0, cls, L"添加自定义目标",
                         WS_CAPTION | WS_SYSMENU | WS_POPUP,
-                        CW_USEDEFAULT, CW_USEDEFAULT, 400, 170,
+                        CW_USEDEFAULT, CW_USEDEFAULT, 400, 200,
                         parent, NULL, wc.hInstance, NULL);
     if (!h) return 0;
     g_addResult = 0;
@@ -1788,12 +1807,17 @@ int wmain(int argc, wchar_t *argv[])
     if (rc == 0) {
         /* 仅在会话内存记录目标,不落盘 */
         {
+            int cli = 0;
+            for (i = 0; i < preset_count(); i++)
+                if (_wcsicmp(PRESETS[i].name, name) == 0) { cli = PRESETS[i].cli; break; }
             int tidx = find_target(name);
-            if (tidx >= 0)
+            if (tidx >= 0) {
                 wcscpy_s(g_targets[tidx].exePath, MAX_PATH, codeExe);
-            else if (g_targetCount < MAX_TARGETS) {
+                g_targets[tidx].cli = cli;
+            } else if (g_targetCount < MAX_TARGETS) {
                 wcscpy_s(g_targets[g_targetCount].name, 64, name);
                 wcscpy_s(g_targets[g_targetCount].exePath, MAX_PATH, codeExe);
+                g_targets[g_targetCount].cli = cli;
                 g_targetCount++;
             }
         }
