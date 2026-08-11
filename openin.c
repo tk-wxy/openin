@@ -755,9 +755,29 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     wchar_t tempDir[MAX_PATH];
     wchar_t cmdline[1024], logBuf[4096];
     wchar_t conflictPath[MAX_PATH], gccPath[MAX_PATH];
+    wchar_t bareHint[256];
     int exeBuilt = 0, pathAlready = 0, conflict = 0, compileFailed = 0;
 
     if (outAddedPath) *outAddedPath = 0;
+    bareHint[0] = L'\0';
+
+    /* npm 裸 shim 拦截检测(仅 CLI): PATH 中同名无扩展名文件会拦截地址栏无后缀命令
+       (原样文件名搜索优先于 PATHEXT 补全),自动改名为 .sh,汇总中告知 */
+    if (cli) {
+        wchar_t barePath[MAX_PATH], shPath[MAX_PATH], *fn;
+        if (find_in_path(name, barePath, MAX_PATH)) {
+            fn = wcsrchr(barePath, L'\\');
+            fn = fn ? fn + 1 : barePath;
+            if (!wcschr(fn, L'.')) {
+                _snwprintf_s(shPath, MAX_PATH, MAX_PATH - 1, L"%s.sh", barePath);
+                if (MoveFileW(barePath, shPath))
+                    _snwprintf_s(bareHint, 256, 255,
+                                 L"\n\n⚠ 已将裸 shim 改名为 %s.sh(npm 的无扩展名文件会拦截地址栏无后缀命令)。\n"
+                                 L"npm 更新该工具后如复现,重新安装本命令即可。",
+                                 barePath);
+            }
+        }
+    }
 
     /* 确保安装目录存在(-p 可能指向尚未创建的目录) */
     CreateDirectoryW(installDir, NULL);
@@ -849,6 +869,7 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     if (conflict) wcscat_s(outSummary, sumSz, conflictPath);
     if (compileFailed && !exeBuilt)
         wcscat_s(outSummary, sumSz, L"\n\n⚠ .exe 编译失败,当前仅 .cmd 生效。");
+    if (bareHint[0]) wcscat_s(outSummary, sumSz, bareHint);
     return 0;
 }
 
