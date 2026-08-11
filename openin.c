@@ -927,6 +927,48 @@ static BOOL scan_root_shallow(const wchar_t *root, const wchar_t *exeName, wchar
     return FALSE;
 }
 
+/* 去掉注册表值两端的空白与引号(部分安装程序登记时带引号/尾随空格) */
+static void trim_reg_path(wchar_t *s)
+{
+    size_t len = wcslen(s);
+    while (len > 0 && (s[len - 1] == L' ' || s[len - 1] == L'\t')) s[--len] = L'\0';
+    if (len >= 2 && s[0] == L'"' && s[len - 1] == L'"') {
+        s[len - 1] = L'\0';
+        memmove(s, s + 1, (len - 1) * sizeof(wchar_t));
+        len = wcslen(s);
+        while (len > 0 && (s[len - 1] == L' ' || s[len - 1] == L'\t')) s[--len] = L'\0';
+    }
+}
+
+/* 读某个注册表键的默认值(REG_SZ/EXPAND_SZ)到 out,成功返回 TRUE */
+static BOOL reg_default_value(HKEY root, const wchar_t *subKey, wchar_t *out, size_t out_sz)
+{
+    DWORD size = (DWORD)(out_sz * sizeof(wchar_t));
+    if (RegGetValueW(root, subKey, NULL, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                     NULL, out, &size) != ERROR_SUCCESS)
+        return FALSE;
+    out[out_sz - 1] = L'\0';
+    trim_reg_path(out);
+    return out[0] != L'\0';
+}
+
+/* App Paths 注册表检测(只读): 安装程序登记的权威位置,零磁盘成本 */
+static BOOL detect_app_registry(const wchar_t *exeName, wchar_t *out, size_t out_sz)
+{
+    static const wchar_t *AP = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths";
+    static const wchar_t *AP32 = L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths";
+    wchar_t subKey[300];
+
+    out[0] = L'\0';
+    _snwprintf_s(subKey, 300, 299, L"%s\\%s", AP, exeName);
+    if (reg_default_value(HKEY_CURRENT_USER, subKey, out, out_sz)) return TRUE;
+    if (reg_default_value(HKEY_LOCAL_MACHINE, subKey, out, out_sz)) return TRUE;
+    _snwprintf_s(subKey, 300, 299, L"%s\\%s", AP32, exeName);
+    if (reg_default_value(HKEY_LOCAL_MACHINE, subKey, out, out_sz)) return TRUE;
+    out[0] = L'\0';
+    return FALSE;
+}
+
 /* 自动检索主程序完整路径;成功返回 TRUE */
 /* fromFallback=1 时不再做 .exe<->.cmd 扩展名回退,避免两两互检导致无限递归 */
 static BOOL detect_app_impl(const wchar_t *exeName, wchar_t *out, size_t out_sz, int fromFallback)
@@ -937,7 +979,10 @@ static BOOL detect_app_impl(const wchar_t *exeName, wchar_t *out, size_t out_sz,
 
     out[0] = L'\0';
 
-    /* 1. PATH 目录 */
+    /* 1. App Paths 注册表(HKCU/HKLM,安装程序登记的权威位置) */
+    if (detect_app_registry(exeName, out, out_sz) && path_exists(out)) return TRUE;
+
+    /* 2. PATH 目录 */
     len = GetEnvironmentVariableW(L"Path", NULL, 0);
     if (len && len < 32768) {
         wchar_t *path = (wchar_t *)malloc((len + 1) * sizeof(wchar_t));
@@ -962,7 +1007,7 @@ static BOOL detect_app_impl(const wchar_t *exeName, wchar_t *out, size_t out_sz,
     }
     if (out[0]) return TRUE;
 
-    /* 2. Programs 常用根(深度 2) */
+    /* 3. Programs 常用根(深度 2) */
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", root, MAX_PATH)) {
         _snwprintf_s(buf, MAX_PATH, MAX_PATH - 1, L"%s\\Programs", root);
         search_tree(buf, exeName, 0, 2, out);
@@ -972,7 +1017,7 @@ static BOOL detect_app_impl(const wchar_t *exeName, wchar_t *out, size_t out_sz,
     if (!out[0] && GetEnvironmentVariableW(L"ProgramFiles(x86)", root, MAX_PATH))
         search_tree(root, exeName, 0, 2, out);
 
-    /* 3. 各固定盘根(一层) */
+    /* 4. 各固定盘根(一层) */
     if (!out[0]) {
         drives = GetLogicalDrives();
         for (i = 0; i < 26; i++) {
@@ -983,7 +1028,7 @@ static BOOL detect_app_impl(const wchar_t *exeName, wchar_t *out, size_t out_sz,
             }
         }
     }
-    /* 4. 扩展名回退策略 (.exe <-> .cmd): 只允许回退一层,防止无限递归 */
+    /* 5. 扩展名回退策略 (.exe <-> .cmd): 只允许回退一层,防止无限递归 */
     if (!out[0] && !fromFallback) {
         wchar_t altName[MAX_PATH];
         wcscpy_s(altName, MAX_PATH, exeName);
