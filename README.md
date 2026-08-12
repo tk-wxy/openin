@@ -11,13 +11,14 @@ Codex……），安装后即可用一行命令以「当前文件夹」为参数
 | 文件 | 作用 |
 |---|---|
 | `openin.exe` | 安装器（双击运行） |
-| `openin.c` | 入口（无参数进 GUI，有参数走 CLI） |
-| `core.c` | 引擎：安装/卸载、launcher 生成 |
-| `detect.c` | 应用自动检索 |
-| `pathenv.c` | PATH / 安装目录操作 |
-| `utils.c` | 路径/校验工具 |
-| `gui.c` | GUI 窗口逻辑 |
-| `openin.h` | 跨模块接口 |
+| `src/openin.c` | 入口（无参数进 GUI，有参数走 CLI） |
+| `src/core.c` | 引擎：安装/卸载、launcher 生成 |
+| `src/detect.c` | 应用自动检索 |
+| `src/pathenv.c` | PATH / 安装目录操作 |
+| `src/utils.c` | 路径/校验工具 |
+| `src/gui.c` | GUI 窗口逻辑 |
+| `src/openin.h` | 跨模块接口 |
+| `scratch/` | launcher 模板工具链（bin2h 等，开发用） |
 
 ## 使用
 
@@ -50,7 +51,7 @@ openin.exe -q -d "D:\..."                   :: 静默模式（不弹窗）
 winget install BrechtSanders.WinLibs.POSIX.UCRT
 
 :: 编译
-gcc -O2 -s -municode -mwindows -o openin.exe openin.c core.c detect.c pathenv.c utils.c gui.c -lshell32 -lole32 -lcomdlg32
+gcc -O2 -s -municode -mwindows -o openin.exe src\openin.c src\core.c src\detect.c src\pathenv.c src\utils.c src\gui.c -Isrc -lshell32 -lole32 -lcomdlg32
 ```
 
 编译参数说明：
