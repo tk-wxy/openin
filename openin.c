@@ -755,29 +755,12 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     wchar_t tempDir[MAX_PATH];
     wchar_t cmdline[1024], logBuf[4096];
     wchar_t conflictPath[MAX_PATH], gccPath[MAX_PATH];
-    wchar_t bareHint[256];
     int exeBuilt = 0, pathAlready = 0, conflict = 0, compileFailed = 0;
 
-    if (outAddedPath) *outAddedPath = 0;
-    bareHint[0] = L'\0';
-
-    /* npm 裸 shim 拦截检测(仅 CLI): PATH 中同名无扩展名文件会拦截地址栏无后缀命令
-       (原样文件名搜索优先于 PATHEXT 补全),自动改名为 .sh,汇总中告知 */
-    if (cli) {
-        wchar_t barePath[MAX_PATH], shPath[MAX_PATH], *fn;
-        if (find_in_path(name, barePath, MAX_PATH)) {
-            fn = wcsrchr(barePath, L'\\');
-            fn = fn ? fn + 1 : barePath;
-            if (!wcschr(fn, L'.')) {
-                _snwprintf_s(shPath, MAX_PATH, MAX_PATH - 1, L"%s.sh", barePath);
-                if (MoveFileW(barePath, shPath))
-                    _snwprintf_s(bareHint, 256, 255,
-                                 L"\n\n⚠ 已将裸 shim 改名为 %s.sh(npm 的无扩展名文件会拦截地址栏无后缀命令)。\n"
-                                 L"npm 更新该工具后如复现,重新安装本命令即可。",
-                                 barePath);
-            }
-        }
-    }
+    /* CLI 工具: 写入 App Paths 注册表(HKCU),实现地址栏/终端分离
+       - 地址栏 'codex' → ShellExecuteEx 查 App Paths → 启动 openin launcher
+       - 终端 'codex' → SearchPath 仅查 PATH → 运行原生 CLI(不受影响)
+       - 卸载时清理注册表键,零残留 */
 
     /* 确保安装目录存在(-p 可能指向尚未创建的目录) */
     CreateDirectoryW(installDir, NULL);
@@ -834,6 +817,22 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
         if (outAddedPath) *outAddedPath = 1;
     }
 
+    /* CLI 工具: 写入 App Paths 注册表(HKCU),地址栏可用无后缀命令 */
+    if (cli && exeBuilt) {
+        wchar_t subKey[300];
+        HKEY hKey;
+        LONG res;
+
+        _snwprintf_s(subKey, 300, 299,
+                     L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%s.exe", name);
+        res = RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
+        if (res == ERROR_SUCCESS) {
+            RegSetValueExW(hKey, L"", 0, REG_SZ, (BYTE*)exePath,
+                           (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
+            RegCloseKey(hKey);
+        }
+    }
+
     /* 冲突检查(.exe 与 .cmd 都要查) */
     _snwprintf_s(cmdline, 1024, 1023, L"%s.exe", name);
     if (find_in_path(cmdline, conflictPath, MAX_PATH) && _wcsicmp(conflictPath, exePath) != 0)
@@ -847,11 +846,11 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     /* 汇总 */
     if (exeBuilt) {
         _snwprintf_s(outSummary, sumSz, sumSz - 1,
-                     L"安装完成 ✓\n命令:   %s (.exe)\n备用:   %s.cmd\n"
+                     L"安装完成 ✓\n命令:   %s (.exe%s)\n备用:   %s.cmd\n"
                      L"目录:   %s (%s)\n应用:   %s\nlauncher: %s\n\n"
                      L"地址栏/终端输入 \"%s\" 或 \"%s.cmd\" 即可打开。\n"
                      L"注意: 已打开的终端/资源管理器需重启生效。%s",
-                     name, name, installDir,
+                     name, cli ? L" + 地址栏注册" : L"", name, installDir,
                      pathAlready ? L"已在 PATH" : L"已加入 PATH",
                      codeExe, exePath, name, name,
                      conflict ? L"\n\n⚠ 检测到 PATH 中另有同名命令:\n" : L"");
@@ -869,21 +868,25 @@ static int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     if (conflict) wcscat_s(outSummary, sumSz, conflictPath);
     if (compileFailed && !exeBuilt)
         wcscat_s(outSummary, sumSz, L"\n\n⚠ .exe 编译失败,当前仅 .cmd 生效。");
-    if (bareHint[0]) wcscat_s(outSummary, sumSz, bareHint);
     return 0;
 }
 
-/* 卸载目标: 只删除 launcher 文件,不做其他任何改动 */
+/* 卸载目标: 删除 launcher 文件 + 清理 App Paths 注册表(CLI) */
 static int uninstall_target(const wchar_t *name, const wchar_t *installDir,
                             wchar_t *outSummary, size_t sumSz)
 {
-    wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH];
+    wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH], subKey[300];
     BOOL any = FALSE;
 
     _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", installDir, name);
     _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
     if (DeleteFileW(exePath)) any = TRUE;
     if (DeleteFileW(cmdPath)) any = TRUE;
+
+    /* 清理 App Paths 注册表(CLI 目标,失败忽略) */
+    _snwprintf_s(subKey, 300, 299,
+                 L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%s.exe", name);
+    RegDeleteKeyW(HKEY_CURRENT_USER, subKey);
 
     if (!any) {
         _snwprintf_s(outSummary, sumSz, sumSz - 1, L"\"%s\" 尚未安装,无需卸载。", name);
