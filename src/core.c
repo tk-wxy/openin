@@ -268,6 +268,90 @@ static BOOL dir_effectively_empty(const wchar_t *dir)
     return !any;
 }
 
+/* 该命令的 launcher 文件是否已安装 */
+BOOL target_installed(const wchar_t *name, const wchar_t *installDir)
+{
+    wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH];
+    _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", installDir, name);
+    _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
+    return path_exists(exePath) || path_exists(cmdPath);
+}
+
+static BOOL name_in_list(const wchar_t *nm, wchar_t (*names)[64], int count)
+{
+    int i;
+    for (i = 0; i < count; i++)
+        if (_wcsicmp(names[i], nm) == 0) return TRUE;
+    return FALSE;
+}
+
+/* 列出安装目录里所有 openin 生成的命令名(去重、字母序、\n 连接);返回个数 */
+int list_installed(const wchar_t *installDir, wchar_t *out, size_t outSz)
+{
+    enum { MAX_NAMES = 256 };
+    wchar_t names[MAX_NAMES][64];
+    int count = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    wchar_t pat[MAX_PATH], fp[MAX_PATH];
+
+    out[0] = L'\0';
+
+    /* 扫 .cmd(每个 openin launcher 必有)与 .exe,用归属签名识别并去重 */
+    {
+        const wchar_t *pats[] = { L"*.cmd", L"*.exe" };
+        int pi;
+        for (pi = 0; pi < 2; pi++) {
+            _snwprintf_s(pat, MAX_PATH, MAX_PATH - 1, L"%s\\%s", installDir, pats[pi]);
+            h = FindFirstFileW(pat, &fd);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            do {
+                _snwprintf_s(fp, MAX_PATH, MAX_PATH - 1, L"%s\\%s", installDir, fd.cFileName);
+                BOOL owned = (pi == 0) ? cmd_is_openin(fp) : exe_is_openin(fp);
+                if (owned) {
+                    wchar_t nm[64];
+                    wcsncpy_s(nm, 64, fd.cFileName, 63);
+                    nm[63] = L'\0';
+                    wchar_t *dot = wcsrchr(nm, L'.');
+                    if (dot) *dot = L'\0';
+                    if (count < MAX_NAMES && !name_in_list(nm, names, count))
+                        wcscpy_s(names[count++], 64, nm);
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
+
+    /* 字母序(插入排序) */
+    {
+        int i;
+        for (i = 1; i < count; i++) {
+            wchar_t key[64];
+            int j = i - 1;
+            wcscpy_s(key, 64, names[i]);
+            while (j >= 0 && _wcsicmp(names[j], key) > 0) {
+                wcscpy_s(names[j + 1], 64, names[j]);
+                j--;
+            }
+            wcscpy_s(names[j + 1], 64, key);
+        }
+    }
+
+    /* 拼接 */
+    {
+        size_t used = 0;
+        int i;
+        for (i = 0; i < count; i++) {
+            size_t n = wcslen(names[i]);
+            if (used + n + 2 > outSz) break;   /* 需 \n + 名称 + \0 的空间 */
+            if (used) out[used++] = L'\n';
+            wcscpy_s(out + used, outSz - used, names[i]);
+            used += n;
+        }
+    }
+    return count;
+}
+
 /* ---------- 生成 launcher 源码 ---------- */
 /*
  * 生成的 launcher: 启动主程序打开「当前工作目录」或命令行参数指定路径。

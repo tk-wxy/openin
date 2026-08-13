@@ -23,9 +23,9 @@ Codex……），安装后即可用一行命令以「当前文件夹」为参数
 ## 使用
 
 ### GUI 界面（推荐）
-双击 `openin.exe`（或无参数运行）打开**管理主窗口**：每个应用一行（名称 + 路径框 + 浏览 + 安装）。
-窗口打开即**自动检索**并填入主程序路径，确认无误后点「安装」即可。
-- 底部「重新检测」重新扫描路径；「高级▾」菜单含卸载、添加自定义
+双击 `openin.exe`（或无参数运行）打开**管理主窗口**：每个应用一行（名称 + 路径框 + 浏览 + 安装 + 测试）。
+窗口打开即**自动检索**并填入主程序路径，确认无误后点「安装」，再用「测试」一键拉起目标验证。
+- 顶部菜单栏「重新检测」重新扫描路径；「高级▾」菜单含卸载、添加自定义
 - **无状态**：只在安装目录创建启动文件（`vscode.exe`/`.cmd`），**不产生任何配置文件、日志或外部文件夹**；
   自定义目标仅存于会话内存，关闭即失
 
@@ -37,6 +37,8 @@ openin.exe -d "D:\Microsoft VS Code" code   :: 自定义命令名
 openin.exe -p C:\Users\you\bin -d "D:\VS Code"   :: 指定安装目录
 openin.exe -u vscode                        :: 卸载指定命令
 openin.exe -q -d "D:\..."                   :: 静默模式（不弹窗）
+openin.exe -l                               :: 列出已安装的命令（打印到终端）
+openin.exe -a                               :: 全部安装：自动检测到的预设一键全装
 ```
 
 > 每个应用装一次，得到一个独立命令：`openin.exe -d "D:\...\Code.exe的目录" vscode`、
@@ -50,8 +52,9 @@ openin.exe -q -d "D:\..."                   :: 静默模式（不弹窗）
 :: 安装 gcc（已装则跳过）
 winget install BrechtSanders.WinLibs.POSIX.UCRT
 
-:: 编译
-gcc -O2 -s -municode -mwindows -o openin.exe src\openin.c src\core.c src\detect.c src\pathenv.c src\utils.c src\gui.c -Isrc -lshell32 -lole32 -lcomdlg32
+:: 编译（两步：先 windres 编 manifest 资源，再链接）
+windres -Isrc src\openin.rc -O coff -o openin_res.o
+gcc -O2 -s -municode -mwindows -o openin.exe src\openin.c src\core.c src\detect.c src\pathenv.c src\utils.c src\gui.c openin_res.o -Isrc -lshell32 -lole32 -lcomdlg32 -lcomctl32
 ```
 
 编译参数说明：

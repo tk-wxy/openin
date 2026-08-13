@@ -27,6 +27,7 @@ enum {
     IDC_ROW_BROWSE = 600,
     IDC_ROW_INSTALL = 700,
     IDC_ROW_REMOVE = 800,
+    IDC_ROW_TEST = 900,
     IDM_ADD = 401,
     IDM_UNINSTALL = 402,
     IDM_ABOUT = 405,
@@ -37,7 +38,7 @@ enum {
 };
 
 static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hStatus, g_hList;
-static HWND *g_name, *g_edit, *g_browse, *g_install, *g_remove, *g_rowStatus;
+static HWND *g_name, *g_edit, *g_browse, *g_install, *g_remove, *g_test, *g_rowStatus;
 static int g_rowCount = 0;
 static int g_activeRow = -1;
 static const wchar_t *g_winClass = L"openin_main";
@@ -143,14 +144,10 @@ static const wchar_t *row_exe_name(int row)
     return NULL;
 }
 
-/* 该命令的 launcher 文件是否已安装 */
+/* 该命令的 launcher 文件是否已安装(见 core.c target_installed) */
 static BOOL is_installed(const wchar_t *name)
 {
-    wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH];
-    if (!g_installDir[0]) return FALSE;
-    _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", g_installDir, name);
-    _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", g_installDir, name);
-    return path_exists(exePath) || path_exists(cmdPath);
+    return target_installed(name, g_installDir);
 }
 
 /* 计算某命令的安装状态 */
@@ -172,13 +169,14 @@ static void destroy_rows(void)
         if (g_browse[i]) DestroyWindow(g_browse[i]);
         if (g_install[i]) DestroyWindow(g_install[i]);
         if (g_remove[i]) DestroyWindow(g_remove[i]);
+        if (g_test[i]) DestroyWindow(g_test[i]);
         if (g_rowStatus[i]) DestroyWindow(g_rowStatus[i]);
     }
     if (g_name) {
         free(g_name); free(g_edit); free(g_browse);
-        free(g_install); free(g_remove); free(g_rowStatus);
+        free(g_install); free(g_remove); free(g_test); free(g_rowStatus);
     }
-    g_name = g_edit = g_browse = g_install = g_remove = g_rowStatus = NULL;
+    g_name = g_edit = g_browse = g_install = g_remove = g_test = g_rowStatus = NULL;
     g_rowCount = 0;
 }
 
@@ -196,8 +194,9 @@ static void build_rows(HWND h)
     g_browse = (HWND *)calloc((size_t)n, sizeof(HWND));
     g_install = (HWND *)calloc((size_t)n, sizeof(HWND));
     g_remove = (HWND *)calloc((size_t)n, sizeof(HWND));
+    g_test = (HWND *)calloc((size_t)n, sizeof(HWND));
     g_rowStatus = (HWND *)calloc((size_t)n, sizeof(HWND));
-    if (!g_name || !g_edit || !g_browse || !g_install || !g_remove || !g_rowStatus)
+    if (!g_name || !g_edit || !g_browse || !g_install || !g_remove || !g_test || !g_rowStatus)
         return;
 
     for (i = 0; i < n; i++) {
@@ -222,6 +221,9 @@ static void build_rows(HWND h)
         g_install[i] = CreateWindowExW(0, L"BUTTON", L"安装",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 90, 26, h,
             (HMENU)(INT_PTR)(IDC_ROW_INSTALL + i), hi, NULL);
+        g_test[i] = CreateWindowExW(0, L"BUTTON", L"测试",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 56, 26, h,
+            (HMENU)(INT_PTR)(IDC_ROW_TEST + i), hi, NULL);
         if (i >= preset_count())   /* 自定义行带「移除」 */
             g_remove[i] = CreateWindowExW(0, L"BUTTON", L"移除",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 50, 26, h,
@@ -284,18 +286,19 @@ static void layout_controls(HWND h)
     RECT rc;
     int m = SCALE(16), rowH = SCALE(64), gap = SCALE(8);
     int nameW = SCALE(150);
-    int browseW = SCALE(64), installW = SCALE(96), removeW = SCALE(56);
+    int browseW = SCALE(64), installW = SCALE(96), testW = SCALE(56), removeW = SCALE(56);
     int btnH = SCALE(28), lineH = SCALE(28);
     int listTop = SCALE(68);
     int w, clientH, yBottom, i;
-    int rightEdge, removeX, installX, browseX, editX, editW;
+    int rightEdge, removeX, testX, installX, browseX, editX, editW;
 
     GetClientRect(h, &rc);
     w = rc.right - rc.left;
     clientH = rc.bottom - rc.top;
     rightEdge = w - m;
     removeX = rightEdge - removeW;
-    installX = removeX - gap - installW;
+    testX = removeX - gap - testW;
+    installX = testX - gap - installW;
     browseX = installX - gap - browseW;
     editX = m + nameW + gap;
     editW = browseX - gap - editX;
@@ -315,6 +318,7 @@ static void layout_controls(HWND h)
         if (g_edit[i]) MoveWindow(g_edit[i], editX, y, editW, lineH, TRUE);
         if (g_browse[i]) MoveWindow(g_browse[i], browseX, y, browseW, btnH, TRUE);
         if (g_install[i]) MoveWindow(g_install[i], installX, y, installW, btnH, TRUE);
+        if (g_test[i]) MoveWindow(g_test[i], testX, y, testW, btnH, TRUE);
         if (g_remove[i]) MoveWindow(g_remove[i], removeX, y, removeW, btnH, TRUE);
         if (g_rowStatus[i]) MoveWindow(g_rowStatus[i], editX, y + lineH + SCALE(4), editW, SCALE(18), TRUE);
     }
@@ -469,6 +473,62 @@ static void uninstall_row(int row)
         remove_target_entry(name);
     SetWindowTextW(g_hStatus, buf);
     update_status(row);
+}
+
+/* 测试启动: 已安装则拉起 launcher 实测(等价于地址栏/终端敲命令) */
+static void test_row(int row)
+{
+    wchar_t name[64], exePath[MAX_PATH], cmdPath[MAX_PATH];
+    wchar_t cmdline[2 * MAX_PATH + 16], st[600];
+    int cli;
+    DWORD flags;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+
+    g_activeRow = row;
+    if (!row_to_name(row, name, 64)) return;
+    if (!target_installed(name, g_installDir)) {
+        SetWindowTextW(g_hStatus, L"未安装,请先点「安装」再测试。");
+        return;
+    }
+
+    cli = (row < preset_count()) ? PRESETS[row].cli : 0;
+    if (row >= preset_count()) {
+        int tidx = find_target(name);
+        if (tidx >= 0) cli = g_targets[tidx].cli;
+    }
+
+    _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", g_installDir, name);
+    _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", g_installDir, name);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    /* GUI 目标无需控制台;CLI 目标新建控制台,子进程继承显示 TUI(等价于终端敲命令) */
+    flags = cli ? CREATE_NEW_CONSOLE : 0;
+
+    if (path_exists(exePath)) {
+        _snwprintf_s(cmdline, 2 * MAX_PATH + 16, 2 * MAX_PATH + 15, L"\"%s\"", exePath);
+    } else if (path_exists(cmdPath)) {
+        _snwprintf_s(cmdline, 2 * MAX_PATH + 16, 2 * MAX_PATH + 15,
+                     L"cmd.exe /c \"\"%s\"\"", cmdPath);
+    } else {
+        SetWindowTextW(g_hStatus, L"未找到 launcher 文件。");
+        return;
+    }
+
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, flags,
+                        NULL, NULL, &si, &pi)) {
+        _snwprintf_s(st, 600, 599, L"启动失败(%lu)。", (unsigned long)GetLastError());
+        SetWindowTextW(g_hStatus, st);
+        return;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    _snwprintf_s(st, 600, 599, L"已启动 \"%s\",请确认目标应用是否打开。", name);
+    SetWindowTextW(g_hStatus, st);
 }
 
 static void remove_custom_row(int row)
@@ -745,6 +805,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         if (LOWORD(w) >= IDC_ROW_INSTALL && LOWORD(w) < IDC_ROW_INSTALL + g_rowCount) {
             install_row(LOWORD(w) - IDC_ROW_INSTALL);
+            return 0;
+        }
+        if (LOWORD(w) >= IDC_ROW_TEST && LOWORD(w) < IDC_ROW_TEST + g_rowCount) {
+            test_row(LOWORD(w) - IDC_ROW_TEST);
             return 0;
         }
         if (LOWORD(w) >= IDC_ROW_REMOVE && LOWORD(w) < IDC_ROW_REMOVE + g_rowCount) {

@@ -55,6 +55,8 @@ BOOL detect_app(const wchar_t *exeName, wchar_t *out, size_t out_sz);
 int  preset_count(void);
 int  find_target(const wchar_t *name);
 void remove_target_entry(const wchar_t *name);
+BOOL target_installed(const wchar_t *name, const wchar_t *installDir);
+int  list_installed(const wchar_t *installDir, wchar_t *out, size_t outSz);
 int  install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
                     const wchar_t *installDir,
                     wchar_t *outSummary, size_t sumSz, int *outAddedPath);

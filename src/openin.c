@@ -30,6 +30,35 @@ static void show(const wchar_t *title, const wchar_t *text, UINT flags)
         MessageBoxW(NULL, text, title, flags);
 }
 
+/* CLI 文本输出: 有 stdout(重定向)走 WriteFile;否则挂父控制台 WriteConsoleW;都没有则回退弹窗 */
+static void cli_print(const wchar_t *title, const wchar_t *text, UINT flags)
+{
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    BOOL attached = FALSE;
+    DWORD written = 0;
+
+    if (!hOut || hOut == INVALID_HANDLE_VALUE) {
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            attached = TRUE;
+            hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        }
+    }
+    if (!hOut || hOut == INVALID_HANDLE_VALUE)
+        hOut = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+
+    if (hOut && hOut != INVALID_HANDLE_VALUE) {
+        /* 控制台走 WriteConsoleW(UTF-16 中文无损);重定向管道/文件则 WriteFile */
+        if (!WriteConsoleW(hOut, text, (DWORD)wcslen(text), &written, NULL))
+            WriteFile(hOut, text, (DWORD)(wcslen(text) * sizeof(wchar_t)), &written, NULL);
+        WriteConsoleW(hOut, L"\r\n", 2, &written, NULL);
+        if (attached) FreeConsole();
+        return;
+    }
+    if (attached) FreeConsole();
+    show(title, text, flags);
+}
+
 /* ---------- 主流程: 无参数进 GUI,有参数走 CLI ---------- */
 int wmain(int argc, wchar_t *argv[])
 {
@@ -39,7 +68,7 @@ int wmain(int argc, wchar_t *argv[])
     wchar_t installDir[MAX_PATH];
     wchar_t buf[4096];
     wchar_t targetOverride[MAX_PATH];
-    int quiet = 0, i, rc, uninstallMode = 0;
+    int quiet = 0, i, rc, uninstallMode = 0, listMode = 0, installAllMode = 0;
 
     if (argc <= 1) {
         return gui_main();                       /* 双击/无参数 → GUI */
@@ -64,6 +93,8 @@ int wmain(int argc, wchar_t *argv[])
             uninstallMode = 1;
             continue;
         }
+        if (_wcsicmp(argv[i], L"-l") == 0) { listMode = 1; continue; }
+        if (_wcsicmp(argv[i], L"-a") == 0) { installAllMode = 1; continue; }
         /* 其它参数视为命令名 */
         if (valid_name(argv[i]))
             wcscpy_s(name, 64, argv[i]);
@@ -84,6 +115,40 @@ int wmain(int argc, wchar_t *argv[])
             remove_target_entry(name);
         show(L"openin", ubuf, urc == 0 ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONERROR);
         return urc;
+    }
+
+    /* 列出已安装模式 */
+    if (listMode) {
+        wchar_t dir[MAX_PATH], list[4096], msg[4300];
+        pick_target_dir(targetOverride, dir, MAX_PATH);
+        int n = list_installed(dir, list, 4096);
+        if (n > 0)
+            _snwprintf_s(msg, 4300, 4299, L"已安装命令(%d 个,目录: %s):\n\n%s", n, dir, list);
+        else
+            _snwprintf_s(msg, 4300, 4299, L"未安装任何命令。(安装目录: %s)", dir);
+        cli_print(L"openin", msg, MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
+
+    /* 全部安装模式: 遍历预设,检出即装、已装跳过 */
+    if (installAllMode) {
+        wchar_t dir[MAX_PATH], found[MAX_PATH], buf[4096], msg[512];
+        int added = 0, skipped = 0, notFound = 0, failed = 0;
+        pick_target_dir(targetOverride, dir, MAX_PATH);
+        for (i = 0; i < preset_count(); i++) {
+            if (target_installed(PRESETS[i].name, dir)) { skipped++; continue; }
+            found[0] = L'\0';
+            if (!detect_app(PRESETS[i].exeName, found, MAX_PATH)) { notFound++; continue; }
+            if (install_target(PRESETS[i].name, found, PRESETS[i].cli, dir, buf, 4096, NULL) == 0)
+                added++;
+            else
+                failed++;
+        }
+        _snwprintf_s(msg, 512, 511,
+                     L"全部安装完成:\n  新增: %d\n  已存在跳过: %d\n  未检出: %d\n  失败: %d\n\n目录: %s",
+                     added, skipped, notFound, failed, dir);
+        cli_print(L"openin", msg, MB_OK | MB_ICONINFORMATION);
+        return failed ? 1 : 0;
     }
 
     /* 选择应用目录 */
