@@ -260,7 +260,7 @@ static void update_status(int row)
 static void update_scrollbar(HWND h)
 {
     RECT rc;
-    int m = SCALE(16), btnH = SCALE(28), gap = SCALE(8), listTop = SCALE(44);
+    int m = SCALE(16), btnH = SCALE(28), gap = SCALE(8), listTop = SCALE(68);
     int clientH, viewportH, contentH;
     SCROLLINFO si;
 
@@ -286,7 +286,7 @@ static void layout_controls(HWND h)
     int nameW = SCALE(150);
     int browseW = SCALE(64), installW = SCALE(96), removeW = SCALE(56);
     int btnH = SCALE(28), lineH = SCALE(28);
-    int listTop = SCALE(44);
+    int listTop = SCALE(68);
     int w, clientH, yBottom, i;
     int rightEdge, removeX, installX, browseX, editX, editW;
 
@@ -301,9 +301,11 @@ static void layout_controls(HWND h)
     editW = browseX - gap - editX;
     yBottom = clientH - m - btnH;
 
-    /* 三段式:顶部标题固定,中部滚动面板裁剪行控件,底部按钮/状态固定——互不重叠 */
+    /* 三段式:顶部菜单栏行(重新检测/高级)+ 标题固定,中部滚动面板裁剪行控件,底部状态固定 */
+    if (g_hRedetect) MoveWindow(g_hRedetect, m, SCALE(6), SCALE(96), btnH, TRUE);
+    if (g_hAdv) MoveWindow(g_hAdv, m + SCALE(96) + gap, SCALE(6), SCALE(80), btnH, TRUE);
     if (g_hHeader)
-        MoveWindow(g_hHeader, m, SCALE(12), w - 2 * m, SCALE(22), TRUE);
+        MoveWindow(g_hHeader, m, SCALE(40), w - 2 * m, SCALE(20), TRUE);
     if (g_hList)
         MoveWindow(g_hList, 0, listTop, w, (yBottom - gap) - listTop, TRUE);
 
@@ -317,11 +319,8 @@ static void layout_controls(HWND h)
         if (g_rowStatus[i]) MoveWindow(g_rowStatus[i], editX, y + lineH + SCALE(4), editW, SCALE(18), TRUE);
     }
 
-    if (g_hRedetect) MoveWindow(g_hRedetect, m, yBottom, SCALE(96), btnH, TRUE);
-    if (g_hAdv) MoveWindow(g_hAdv, m + SCALE(96) + gap, yBottom, SCALE(80), btnH, TRUE);
-    if (g_hStatus) MoveWindow(g_hStatus, m + SCALE(96) + gap + SCALE(80) + gap,
-                              yBottom + (btnH - SCALE(20)) / 2,
-                              rightEdge - (m + SCALE(96) + gap + SCALE(80) + gap), SCALE(20), TRUE);
+    if (g_hStatus) MoveWindow(g_hStatus, m, yBottom + (btnH - SCALE(20)) / 2,
+                              rightEdge - m, SCALE(20), TRUE);
 
     update_scrollbar(h);
 }
@@ -815,7 +814,7 @@ int gui_main(void)
 
     hwnd = CreateWindowExW(0, g_winClass, L"openin — 打开到应用",
                            WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_CLIPCHILDREN,
-                           CW_USEDEFAULT, CW_USEDEFAULT, SCALE(760), SCALE(560),
+                           CW_USEDEFAULT, CW_USEDEFAULT, SCALE(760), SCALE(584),
                            NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) return 1;
     ShowWindow(hwnd, SW_SHOW);
