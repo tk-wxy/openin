@@ -577,6 +577,7 @@ const Preset PRESETS[] = {
     { L"wt",       L"wt.exe",            L"Windows Terminal",0 },
     { L"claude",   L"claude.exe",        L"Claude Code",     1 },
     { L"codex",    L"codex.cmd",         L"Codex",           1 },
+    { L"opencode", L"opencode.cmd",      L"OpenCode",        1 },
 };
 
 int preset_count(void) { return (int)(sizeof(PRESETS) / sizeof(PRESETS[0])); }
