@@ -110,7 +110,7 @@ int wmain(int argc, wchar_t *argv[])
         wchar_t ubuf[1024];
         wchar_t udir[MAX_PATH];
         pick_target_dir(targetOverride, udir, MAX_PATH);   /* 启动器在自动选择的目录 */
-        int urc = uninstall_target(name, udir, ubuf, 1024);
+        int urc = uninstall_target(name, udir, ubuf, 1024, NULL);
         if (urc == 0)
             remove_target_entry(name);
         show(L"openin", ubuf, urc == 0 ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONERROR);
@@ -139,7 +139,7 @@ int wmain(int argc, wchar_t *argv[])
             if (target_installed(PRESETS[i].name, dir)) { skipped++; continue; }
             found[0] = L'\0';
             if (!detect_app(PRESETS[i].exeName, found, MAX_PATH)) { notFound++; continue; }
-            if (install_target(PRESETS[i].name, found, PRESETS[i].cli, dir, buf, 4096, NULL) == 0)
+            if (install_target(PRESETS[i].name, found, PRESETS[i].cli, dir, buf, 4096, NULL, NULL) == 0)
                 added++;
             else
                 failed++;
@@ -180,7 +180,7 @@ int wmain(int argc, wchar_t *argv[])
         int cli = 0;
         for (i = 0; i < preset_count(); i++)
             if (_wcsicmp(PRESETS[i].name, name) == 0) { cli = PRESETS[i].cli; break; }
-        rc = install_target(name, codeExe, cli, installDir, buf, 4096, NULL);
+        rc = install_target(name, codeExe, cli, installDir, buf, 4096, NULL, NULL);
     }
     if (rc == 0) {
         /* 仅在会话内存记录目标,不落盘 */

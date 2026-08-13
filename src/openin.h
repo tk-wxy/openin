@@ -27,6 +27,7 @@ typedef struct {
     const wchar_t *exeName;  /* 主程序文件名(用于定位);cli 时为主命令的 shim 名 */
     const wchar_t *display;  /* 界面显示名 */
     int cli;                 /* 1 = 命令行工具: 继承 cwd,不传目录参数 */
+    int native;              /* 1 = 原生地址栏 CLI(如 claude): openin 不创建/不卸载其命令,安装按钮改为「修复」 */
 } Preset;
 
 extern const Preset PRESETS[];
@@ -58,11 +59,12 @@ int  find_target(const wchar_t *name);
 void remove_target_entry(const wchar_t *name);
 BOOL target_installed(const wchar_t *name, const wchar_t *installDir);
 int  list_installed(const wchar_t *installDir, wchar_t *out, size_t outSz);
+typedef void (*StepCb)(const wchar_t *msg);   /* 操作步骤回调: 安装/卸载时逐条通报,可为 NULL */
 int  install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
                     const wchar_t *installDir,
-                    wchar_t *outSummary, size_t sumSz, int *outAddedPath);
+                    wchar_t *outSummary, size_t sumSz, int *outAddedPath, StepCb onStep);
 int  uninstall_target(const wchar_t *name, const wchar_t *installDir,
-                      wchar_t *outSummary, size_t sumSz);
+                      wchar_t *outSummary, size_t sumSz, StepCb onStep);
 
 /* ---------- gui.c ---------- */
 int  gui_main(void);

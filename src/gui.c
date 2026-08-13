@@ -30,6 +30,7 @@ enum {
     IDC_ROW_INSTALL = 700,
     IDC_ROW_REMOVE = 800,
     IDC_ROW_TEST = 900,
+    IDC_ROW_UNINSTALL = 1000,
     IDM_ADD = 401,
     IDM_UNINSTALL = 402,
     IDM_ABOUT = 405,
@@ -40,7 +41,7 @@ enum {
 };
 
 static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hDeepScan, g_hStatus, g_hList;
-static HWND *g_name, *g_edit, *g_browse, *g_install, *g_remove, *g_test, *g_rowStatus;
+static HWND *g_name, *g_edit, *g_browse, *g_install, *g_remove, *g_test, *g_uninstall, *g_rowStatus;
 static int g_rowCount = 0;
 static int g_activeRow = -1;
 static const wchar_t *g_winClass = L"openin_main";
@@ -149,6 +150,12 @@ static const wchar_t *row_exe_name(int row)
     return NULL;
 }
 
+/* 该预设是否为「原生地址栏 CLI」(openin 不创建/不卸载其命令,安装按钮改为「修复」) */
+static BOOL is_native_row(int row)
+{
+    return row >= 0 && row < preset_count() && PRESETS[row].native != 0;
+}
+
 /* 该命令的 launcher 文件是否已安装(见 core.c target_installed) */
 static BOOL is_installed(const wchar_t *name)
 {
@@ -175,13 +182,14 @@ static void destroy_rows(void)
         if (g_install[i]) DestroyWindow(g_install[i]);
         if (g_remove[i]) DestroyWindow(g_remove[i]);
         if (g_test[i]) DestroyWindow(g_test[i]);
+        if (g_uninstall[i]) DestroyWindow(g_uninstall[i]);
         if (g_rowStatus[i]) DestroyWindow(g_rowStatus[i]);
     }
     if (g_name) {
         free(g_name); free(g_edit); free(g_browse);
-        free(g_install); free(g_remove); free(g_test); free(g_rowStatus);
+        free(g_install); free(g_remove); free(g_test); free(g_uninstall); free(g_rowStatus);
     }
-    g_name = g_edit = g_browse = g_install = g_remove = g_test = g_rowStatus = NULL;
+    g_name = g_edit = g_browse = g_install = g_remove = g_test = g_uninstall = g_rowStatus = NULL;
     g_rowCount = 0;
 }
 
@@ -200,8 +208,9 @@ static void build_rows(HWND h)
     g_install = (HWND *)calloc((size_t)n, sizeof(HWND));
     g_remove = (HWND *)calloc((size_t)n, sizeof(HWND));
     g_test = (HWND *)calloc((size_t)n, sizeof(HWND));
+    g_uninstall = (HWND *)calloc((size_t)n, sizeof(HWND));
     g_rowStatus = (HWND *)calloc((size_t)n, sizeof(HWND));
-    if (!g_name || !g_edit || !g_browse || !g_install || !g_remove || !g_test || !g_rowStatus)
+    if (!g_name || !g_edit || !g_browse || !g_install || !g_remove || !g_test || !g_uninstall || !g_rowStatus)
         return;
 
     for (i = 0; i < n; i++) {
@@ -230,6 +239,9 @@ static void build_rows(HWND h)
         g_test[i] = CreateWindowExW(0, L"BUTTON", L"测试",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 56, 26, h,
             (HMENU)(INT_PTR)(IDC_ROW_TEST + i), hi, NULL);
+        g_uninstall[i] = CreateWindowExW(0, L"BUTTON", L"卸载",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 56, 26, h,
+            (HMENU)(INT_PTR)(IDC_ROW_UNINSTALL + i), hi, NULL);
         if (i >= preset_count())   /* 自定义行带「移除」 */
             g_remove[i] = CreateWindowExW(0, L"BUTTON", L"移除",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 50, 26, h,
@@ -260,9 +272,20 @@ static void update_status(int row)
     wchar_t name[64], st[64];
 
     if (!row_to_name(row, name, 64)) return;
+    if (is_native_row(row)) {
+        /* 原生 CLI: 命令二进制在安装目录才可用;状态与按钮反映「修复」而非 openin 安装 */
+        wchar_t dest[MAX_PATH];
+        _snwprintf_s(dest, MAX_PATH, MAX_PATH - 1, L"%s\\%s", g_installDir, PRESETS[row].exeName);
+        wcscpy_s(st, 64, path_exists(dest) ? L"原生命令" : L"原生命令(缺失)");
+        SetWindowTextW(g_rowStatus[row], st);
+        SetWindowTextW(g_install[row], L"修复");
+        if (g_uninstall[row]) EnableWindow(g_uninstall[row], FALSE);   /* 原生不可卸载 */
+        return;
+    }
     target_status(name, st, 64);
     SetWindowTextW(g_rowStatus[row], st);
     SetWindowTextW(g_install[row], is_installed(name) ? L"更新" : L"安装");
+    if (g_uninstall[row]) EnableWindow(g_uninstall[row], TRUE);
 }
 
 static void update_scrollbar(HWND h)
@@ -294,11 +317,11 @@ static void layout_controls(HWND h)
     RECT rc;
     int m = SCALE(16), rowH = SCALE(64), gap = SCALE(8);
     int nameW = SCALE(150);
-    int browseW = SCALE(64), installW = SCALE(96), testW = SCALE(56), removeW = SCALE(56);
+    int browseW = SCALE(64), installW = SCALE(96), testW = SCALE(56), removeW = SCALE(56), uninstallW = SCALE(56);
     int btnH = SCALE(28), lineH = SCALE(28);
     int listTop = SCALE(68);
     int w, clientH, viewportH, yBottom, i;
-    int rightEdge, removeX, testX, installX, browseX, editX, editW;
+    int rightEdge, removeX, uninstallX, testX, installX, browseX, editX, editW;
     int first, last;
     HDWP hdwp;
 
@@ -308,7 +331,8 @@ static void layout_controls(HWND h)
     w = rc.right - rc.left;
     clientH = rc.bottom - rc.top;
     rightEdge = w - m;
-    removeX = rightEdge - removeW;
+    uninstallX = rightEdge - uninstallW;
+    removeX = uninstallX - gap - removeW;
     testX = removeX - gap - testW;
     installX = testX - gap - installW;
     browseX = installX - gap - browseW;
@@ -347,7 +371,7 @@ static void layout_controls(HWND h)
         EndDeferWindowPos(hdwp);
     }
 
-    hdwp = BeginDeferWindowPos(g_rowCount * 7 + 8);
+    hdwp = BeginDeferWindowPos(g_rowCount * 8 + 8);
     if (hdwp) {
         const UINT df = SWP_NOZORDER | SWP_NOACTIVATE;
         for (i = 0; i < g_rowCount; i++) {
@@ -364,6 +388,8 @@ static void layout_controls(HWND h)
                 DeferWindowPos(hdwp, g_install[i], NULL, installX, y, installW, btnH, df);
             if (g_test[i])
                 DeferWindowPos(hdwp, g_test[i], NULL, testX, y, testW, btnH, df);
+            if (g_uninstall[i])
+                DeferWindowPos(hdwp, g_uninstall[i], NULL, uninstallX, y, uninstallW, btnH, df);
             if (g_remove[i])
                 DeferWindowPos(hdwp, g_remove[i], NULL, removeX, y, removeW, btnH, df);
             if (g_rowStatus[i])
@@ -489,6 +515,46 @@ static void browse_row(int row)
     }
 }
 
+/* 安装/卸载步骤闪显(左下角状态栏): 同步重绘不泵消息,无重入风险;100ms 短暂停留肉眼可读 */
+static void install_step_cb(const wchar_t *msg)
+{
+    SetWindowTextW(g_hStatus, msg);
+    UpdateWindow(g_hStatus);
+    Sleep(100);
+}
+
+/* 原生 CLI 修复: 确保 安装目录\<exeName> 存在真实二进制(复制自核心程序位置),不覆盖非 openin 内容 */
+static void repair_row(int row)
+{
+    wchar_t name[64], src[MAX_PATH], dst[MAX_PATH], st[300];
+
+    if (!row_to_name(row, name, 64)) return;
+    GetWindowTextW(g_edit[row], src, MAX_PATH);
+    _snwprintf_s(dst, MAX_PATH, MAX_PATH - 1, L"%s\\%s", g_installDir, PRESETS[row].exeName);
+
+    if (!src[0]) {
+        SetWindowTextW(g_hStatus, L"核心程序路径为空,请先浏览选择或深度扫描检出。");
+        return;
+    }
+    if (_wcsicmp(src, dst) == 0) {
+        SetWindowTextW(g_hStatus, L"命令已在正确位置,无需修复。");
+        return;
+    }
+    if (path_exists(dst)) {
+        _snwprintf_s(st, 300, 299, L"目标已存在,已跳过(不覆盖非 openin 内容):\n%s", dst);
+        SetWindowTextW(g_hStatus, st);
+        return;
+    }
+    if (CopyFileW(src, dst, TRUE)) {
+        _snwprintf_s(st, 300, 299, L"已修复: 已将 %s 恢复到\n%s", PRESETS[row].exeName, dst);
+        SetWindowTextW(g_edit[row], dst);
+    } else {
+        _snwprintf_s(st, 300, 299, L"修复失败: 复制 %s 到 %s 出错。", PRESETS[row].exeName, dst);
+    }
+    SetWindowTextW(g_hStatus, st);
+    update_status(row);
+}
+
 static void install_row(int row)
 {
     wchar_t name[64], path[MAX_PATH], codeExe[MAX_PATH], buf[4096];
@@ -497,6 +563,7 @@ static void install_row(int row)
 
     g_activeRow = row;
     if (!row_to_name(row, name, 64)) return;
+    if (is_native_row(row)) { repair_row(row); return; }   /* 原生 CLI: 修复而非安装 */
     GetWindowTextW(g_edit[row], path, MAX_PATH);
     if (!path[0] && row < preset_count())
         detect_app(PRESETS[row].exeName, path, MAX_PATH);
@@ -522,7 +589,7 @@ static void install_row(int row)
             tidx = find_target(name);
             if (tidx >= 0) cli = g_targets[tidx].cli;
         }
-        if (install_target(name, codeExe, cli, g_installDir, buf, 4096, NULL) == 0) {
+        if (install_target(name, codeExe, cli, g_installDir, buf, 4096, NULL, install_step_cb) == 0) {
             tidx = find_target(name);
             if (tidx >= 0) {
                 wcscpy_s(g_targets[tidx].exePath, MAX_PATH, codeExe);
@@ -547,7 +614,11 @@ static void uninstall_row(int row)
 
     g_activeRow = row;
     if (!row_to_name(row, name, 64)) return;
-    if (uninstall_target(name, g_installDir, buf, 1024) == 0)
+    if (is_native_row(row)) {
+        SetWindowTextW(g_hStatus, L"原生实现,openin 无法卸载。");
+        return;
+    }
+    if (uninstall_target(name, g_installDir, buf, 1024, install_step_cb) == 0)
         remove_target_entry(name);
     SetWindowTextW(g_hStatus, buf);
     update_status(row);
@@ -779,7 +850,9 @@ static void show_adv_menu(HWND h)
     } else {
         wcscpy_s(label, 128, L"卸载(未选择)");
     }
-    AppendMenuW(m, MF_STRING | (g_activeRow >= 0 ? MF_ENABLED : MF_GRAYED), IDM_UNINSTALL, label);
+    /* 原生 CLI(如 claude): openin 无法卸载原生实现,置灰 */
+    AppendMenuW(m, MF_STRING | ((g_activeRow >= 0 && !is_native_row(g_activeRow)) ? MF_ENABLED : MF_GRAYED),
+                IDM_UNINSTALL, label);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_ADD, L"添加自定义…");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -910,6 +983,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         if (LOWORD(w) >= IDC_ROW_REMOVE && LOWORD(w) < IDC_ROW_REMOVE + g_rowCount) {
             remove_custom_row(LOWORD(w) - IDC_ROW_REMOVE);
+            return 0;
+        }
+        if (LOWORD(w) >= IDC_ROW_UNINSTALL && LOWORD(w) < IDC_ROW_UNINSTALL + g_rowCount) {
+            uninstall_row(LOWORD(w) - IDC_ROW_UNINSTALL);
             return 0;
         }
         switch (LOWORD(w)) {

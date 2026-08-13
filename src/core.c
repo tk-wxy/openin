@@ -640,10 +640,16 @@ void remove_target_entry(const wchar_t *name)
  * 安装单个目标: 写 .cmd 备用启动器 → 有 gcc 则编译 .exe → 加入 PATH → 冲突检查。
  * 成功返回 0,失败返回 1;summary 写入 outSummary。
  * outAddedPath 记录本次是否真的往用户 PATH 追加了目录。
+ * onStep 非空时逐条通报操作步骤(供 GUI 左下角闪显,信息公开)。
  */
+static void emit_step(StepCb cb, const wchar_t *msg)
+{
+    if (cb) cb(msg);
+}
+
 int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
                    const wchar_t *installDir,
-                   wchar_t *outSummary, size_t sumSz, int *outAddedPath)
+                   wchar_t *outSummary, size_t sumSz, int *outAddedPath, StepCb onStep)
 {
     wchar_t cmdPath[MAX_PATH], exePath[MAX_PATH], srcPath[MAX_PATH], logPath[MAX_PATH];
     wchar_t tempDir[MAX_PATH];
@@ -674,6 +680,7 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     _snwprintf_s(logPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s-build.log", tempDir, name);
 
     /* 覆盖保护: 已存在同名文件且不是 openin 生成的,拒绝覆盖(防误毁真实工具) */
+    emit_step(onStep, L"检查同名文件归属…");
     {
         BOOL cmdExists = path_exists(cmdPath);
         BOOL exeExists = path_exists(exePath);
@@ -698,6 +705,11 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     }
 
     /* .cmd 备用启动器(无需编译器,始终生成) */
+    {
+        wchar_t st[400];
+        _snwprintf_s(st, 400, 399, L"写入 %s.cmd 备用启动器…", name);
+        emit_step(onStep, st);
+    }
     if (!write_launcher_cmd(codeExe, cli, cmdPath)) {
         _snwprintf_s(outSummary, sumSz, sumSz - 1,
                      L"生成 .cmd 备用启动器失败:\n%s", cmdPath);
@@ -705,12 +717,22 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     }
 
     /* 1. 优先使用预编译二进制 Patch 模板生成 .exe (免 GCC 模式, 毫秒级完成, 无环境依赖) */
+    {
+        wchar_t st[400];
+        _snwprintf_s(st, 400, 399, L"生成 %s.exe(二进制 Patch)…", name);
+        emit_step(onStep, st);
+    }
     if (write_launcher_binary(codeExe, cli, exePath)) {
         exeBuilt = 1;
     }
     /* 2. 备用: 若二进制 Patch 失败且系统存在 gcc, 则降级使用 gcc 动态编译 */
     else if (find_in_path(L"gcc.exe", gccPath, MAX_PATH)) {
         if (write_launcher_source(codeExe, name, cli, srcPath)) {
+            {
+                wchar_t st[400];
+                _snwprintf_s(st, 400, 399, L"用 gcc 编译 %s.exe…", name);
+                emit_step(onStep, st);
+            }
             _snwprintf_s(cmdline, 1024, 1023,
                          L"gcc -O2 -s -municode -mwindows -o \"%s\" \"%s\"", exePath, srcPath);
             if (run_gcc(cmdline, logPath, logBuf, 4096))
@@ -726,6 +748,7 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     }
 
     /* 撤销标记: 先写标记、后改 PATH——「PATH 被改 ⟹ 标记存在」的不变量,标记写失败则跳过加 PATH */
+    emit_step(onStep, L"写撤销标记 .openin-undo…");
     {
         BOOL pathWillAdd = !path_in_environment(installDir);
         BOOL oldPath = FALSE, oldDir = FALSE;
@@ -750,6 +773,9 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     /* PATH: 目录已在 PATH 中则无需修改 */
     pathAlready = path_in_environment(installDir);
     if (!pathAlready) {
+        wchar_t st[400];
+        _snwprintf_s(st, 400, 399, L"追加用户 PATH: %s…", installDir);
+        emit_step(onStep, st);
         if (!add_to_user_path(installDir)) {
             _snwprintf_s(outSummary, sumSz, sumSz - 1,
                          L"已生成,但自动加入 PATH 失败。\n请手动把该目录加入用户 PATH:\n%s",
@@ -765,6 +791,7 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
         HKEY hKey;
         LONG res;
 
+        emit_step(onStep, L"写 App Paths 注册表(地址栏/终端隔离)…");
         _snwprintf_s(subKey, 300, 299,
                      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%s.exe", name);
         res = RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
@@ -815,7 +842,7 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
 
 /* 卸载目标: 按归属删 launcher + 清理 App Paths;最后一个 launcher 时撤销 PATH 追加与目录创建 */
 int uninstall_target(const wchar_t *name, const wchar_t *installDir,
-                     wchar_t *outSummary, size_t sumSz)
+                     wchar_t *outSummary, size_t sumSz, StepCb onStep)
 {
     wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH], subKey[300];
     BOOL any = FALSE, cmdExists, exeExists, cmdOwned, exeOwned;
@@ -824,6 +851,7 @@ int uninstall_target(const wchar_t *name, const wchar_t *installDir,
     _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
 
     /* 归属检查: 只动 openin 生成的文件,防误删真实工具 */
+    emit_step(onStep, L"检查文件归属…");
     cmdExists = path_exists(cmdPath);
     exeExists = path_exists(exePath);
     cmdOwned = cmd_is_openin(cmdPath);
@@ -840,10 +868,16 @@ int uninstall_target(const wchar_t *name, const wchar_t *installDir,
         return 1;
     }
 
+    {
+        wchar_t st[400];
+        _snwprintf_s(st, 400, 399, L"删除 %s 启动器…", name);
+        emit_step(onStep, st);
+    }
     if (cmdOwned) { if (DeleteFileW(cmdPath)) any = TRUE; }
     if (exeOwned) { if (DeleteFileW(exePath)) any = TRUE; }
 
     /* 清理 App Paths 注册表(CLI 目标,失败忽略) */
+    emit_step(onStep, L"清理 App Paths 注册表…");
     _snwprintf_s(subKey, 300, 299,
                  L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%s.exe", name);
     RegDeleteKeyW(HKEY_CURRENT_USER, subKey);
@@ -866,6 +900,9 @@ int uninstall_target(const wchar_t *name, const wchar_t *installDir,
         if (read_undo_marker(installDir, &pathAdded, &dirCreated)) {
             if (dir_effectively_empty(installDir)) {
                 if (pathAdded) {
+                    wchar_t st[400];
+                    _snwprintf_s(st, 400, 399, L"从用户 PATH 移除 %s…", installDir);
+                    emit_step(onStep, st);
                     if (remove_from_user_path(installDir))
                         wcscat_s(outSummary, sumSz, L"\n已从用户 PATH 移除安装目录。");
                     else
@@ -873,6 +910,7 @@ int uninstall_target(const wchar_t *name, const wchar_t *installDir,
                 }
                 delete_undo_marker(installDir);
                 if (dirCreated) {
+                    emit_step(onStep, L"删除 openin 创建的空目录…");
                     if (RemoveDirectoryW(installDir))
                         wcscat_s(outSummary, sumSz, L"\n已删除 openin 创建的空目录。");
                     else
@@ -891,25 +929,25 @@ int uninstall_target(const wchar_t *name, const wchar_t *installDir,
 
 /* ---------- 预设模板 ---------- */
 const Preset PRESETS[] = {
-    { L"vscode",   L"Code.exe",          L"VS Code",         0 },
-    { L"cursor",   L"Cursor.exe",        L"Cursor",          0 },
-    { L"windsurf", L"Windsurf.exe",      L"Windsurf",        0 },
-    { L"zed",      L"zed.exe",           L"Zed Editor",      0 },
-    { L"sublime",  L"sublime_text.exe",  L"Sublime Text",    0 },
-    { L"idea",     L"idea64.exe",        L"IntelliJ IDEA",   0 },
-    { L"pycharm",  L"pycharm64.exe",     L"PyCharm",         0 },
-    { L"webstorm", L"webstorm64.exe",    L"WebStorm",        0 },
-    { L"clion",    L"clion64.exe",       L"CLion",           0 },
-    { L"goland",   L"goland64.exe",      L"GoLand",          0 },
-    { L"rider",    L"rider64.exe",       L"Rider",           0 },
-    { L"datagrip", L"datagrip64.exe",    L"DataGrip",        0 },
-    { L"rustrover",L"rustrover64.exe",   L"RustRover",       0 },
-    { L"fleet",    L"Fleet.exe",         L"JetBrains Fleet", 0 },
-    { L"neovide",  L"neovide.exe",       L"Neovide",         0 },
-    { L"wt",       L"wt.exe",            L"Windows Terminal",0 },
-    { L"claude",   L"claude.exe",        L"Claude Code",     1 },
-    { L"codex",    L"codex.cmd",         L"Codex",           1 },
-    { L"opencode", L"opencode.cmd",      L"OpenCode",        1 },
+    { L"vscode",   L"Code.exe",          L"VS Code",         0, 0 },
+    { L"cursor",   L"Cursor.exe",        L"Cursor",          0, 0 },
+    { L"windsurf", L"Windsurf.exe",      L"Windsurf",        0, 0 },
+    { L"zed",      L"zed.exe",           L"Zed Editor",      0, 0 },
+    { L"sublime",  L"sublime_text.exe",  L"Sublime Text",    0, 0 },
+    { L"idea",     L"idea64.exe",        L"IntelliJ IDEA",   0, 0 },
+    { L"pycharm",  L"pycharm64.exe",     L"PyCharm",         0, 0 },
+    { L"webstorm", L"webstorm64.exe",    L"WebStorm",        0, 0 },
+    { L"clion",    L"clion64.exe",       L"CLion",           0, 0 },
+    { L"goland",   L"goland64.exe",      L"GoLand",          0, 0 },
+    { L"rider",    L"rider64.exe",       L"Rider",           0, 0 },
+    { L"datagrip", L"datagrip64.exe",    L"DataGrip",        0, 0 },
+    { L"rustrover",L"rustrover64.exe",   L"RustRover",       0, 0 },
+    { L"fleet",    L"Fleet.exe",         L"JetBrains Fleet", 0, 0 },
+    { L"neovide",  L"neovide.exe",       L"Neovide",         0, 0 },
+    { L"wt",       L"wt.exe",            L"Windows Terminal",0, 0 },
+    { L"claude",   L"claude.exe",        L"Claude Code",     1, 1 },
+    { L"codex",    L"codex.cmd",         L"Codex",           1, 0 },
+    { L"opencode", L"opencode.cmd",      L"OpenCode",        1, 0 },
 };
 
 int preset_count(void) { return (int)(sizeof(PRESETS) / sizeof(PRESETS[0])); }
