@@ -54,7 +54,7 @@ winget install BrechtSanders.WinLibs.POSIX.UCRT
 
 :: 编译（两步：先 windres 编 manifest 资源，再链接）
 windres -Isrc src\openin.rc -O coff -o openin_res.o
-gcc -O2 -s -municode -mwindows -o openin.exe src\openin.c src\core.c src\detect.c src\pathenv.c src\utils.c src\gui.c openin_res.o -Isrc -lshell32 -lole32 -lcomdlg32 -lcomctl32
+gcc -O2 -s -municode -mwindows -o openin.exe src\openin.c src\core.c src\detect.c src\pathenv.c src\utils.c src\gui.c openin_res.o -Isrc -lshell32 -lole32 -lcomdlg32 -lcomctl32 -luxtheme
 ```
 
 编译参数说明：

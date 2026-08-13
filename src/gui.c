@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <uxtheme.h>      /* SetWindowTheme: 编辑框现代扁平边框 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -212,9 +213,10 @@ static void build_rows(HWND h)
         }
         g_name[i] = CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE,
             0, 0, 120, 20, h, NULL, hi, NULL);
-        g_edit[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 100, 22, h,
+        g_edit[i] = CreateWindowExW(0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, 0, 0, 100, 22, h,
             (HMENU)(INT_PTR)(IDC_ROW_EDIT + i), hi, NULL);
+        if (g_edit[i]) SetWindowTheme(g_edit[i], L"Explorer", NULL);  /* 现代扁平边框(替代经典 3D 凹陷) */
         g_browse[i] = CreateWindowExW(0, L"BUTTON", L"浏览",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 60, 24, h,
             (HMENU)(INT_PTR)(IDC_ROW_BROWSE + i), hi, NULL);
@@ -279,6 +281,8 @@ static void update_scrollbar(HWND h)
     si.nPage = (UINT)(viewportH > 0 ? viewportH : 1);
     si.nPos = g_scrollY;
     SetScrollInfo(h, SB_VERT, &si, TRUE);
+    GetScrollInfo(h, SB_VERT, &si);          /* 读回系统按范围钳制后的位置 */
+    g_scrollY = (int)si.nPos;
 }
 
 static void layout_controls(HWND h)
@@ -289,8 +293,12 @@ static void layout_controls(HWND h)
     int browseW = SCALE(64), installW = SCALE(96), testW = SCALE(56), removeW = SCALE(56);
     int btnH = SCALE(28), lineH = SCALE(28);
     int listTop = SCALE(68);
-    int w, clientH, yBottom, i;
+    int w, clientH, viewportH, yBottom, i;
     int rightEdge, removeX, testX, installX, browseX, editX, editW;
+    int first, last;
+    HDWP hdwp;
+
+    update_scrollbar(h);   /* 先按范围钳制 g_scrollY, 供本次布局使用 */
 
     GetClientRect(h, &rc);
     w = rc.right - rc.left;
@@ -303,30 +311,60 @@ static void layout_controls(HWND h)
     editX = m + nameW + gap;
     editW = browseX - gap - editX;
     yBottom = clientH - m - btnH;
+    viewportH = (yBottom - gap) - listTop;   /* 滚动面板可视高度 */
 
-    /* 三段式:顶部菜单栏行(重新检测/高级)+ 标题固定,中部滚动面板裁剪行控件,底部状态固定 */
-    if (g_hRedetect) MoveWindow(g_hRedetect, m, SCALE(6), SCALE(96), btnH, TRUE);
-    if (g_hAdv) MoveWindow(g_hAdv, m + SCALE(96) + gap, SCALE(6), SCALE(80), btnH, TRUE);
-    if (g_hHeader)
-        MoveWindow(g_hHeader, m, SCALE(40), w - 2 * m, SCALE(20), TRUE);
-    if (g_hList)
-        MoveWindow(g_hList, 0, listTop, w, (yBottom - gap) - listTop, TRUE);
+    /* 可见行范围(含上/下一行余量,跨界行也参与重排) */
+    first = (g_scrollY - rowH) / rowH;
+    if (first > 0) first--;
+    if (first < 0) first = 0;
+    last = (g_scrollY + viewportH + rowH) / rowH;
+    if (last >= g_rowCount) last = g_rowCount - 1;
+    if (first > last) first = last;   /* 内容不足一屏时 */
 
-    for (i = 0; i < g_rowCount; i++) {
-        int y = SCALE(4) + i * rowH - g_scrollY;   /* 相对列表面板,越界由面板裁剪 */
-        if (g_name[i]) MoveWindow(g_name[i], m, y + (lineH - SCALE(20)) / 2, nameW, SCALE(20), TRUE);
-        if (g_edit[i]) MoveWindow(g_edit[i], editX, y, editW, lineH, TRUE);
-        if (g_browse[i]) MoveWindow(g_browse[i], browseX, y, browseW, btnH, TRUE);
-        if (g_install[i]) MoveWindow(g_install[i], installX, y, installW, btnH, TRUE);
-        if (g_test[i]) MoveWindow(g_test[i], testX, y, testW, btnH, TRUE);
-        if (g_remove[i]) MoveWindow(g_remove[i], removeX, y, removeW, btnH, TRUE);
-        if (g_rowStatus[i]) MoveWindow(g_rowStatus[i], editX, y + lineH + SCALE(4), editW, SCALE(18), TRUE);
+    /* 批量移动一次成型: 避免每行 MoveWindow 各自触发重绘,滚动大幅提速。
+     * 注意: 同一批次不能同时移动父窗口和它的子控件(EndDeferWindowPos 会静默不生效),
+     * 因此主窗口子级与列表面板内的行控件分两个批次。 */
+    hdwp = BeginDeferWindowPos(8);
+    if (hdwp) {
+        const UINT df = SWP_NOZORDER | SWP_NOACTIVATE;
+        /* 三段式:顶部菜单栏行(重新检测/高级)+ 标题固定,中部滚动面板裁剪行控件,底部状态固定 */
+        if (g_hRedetect)
+            DeferWindowPos(hdwp, g_hRedetect, NULL, m, SCALE(6), SCALE(96), btnH, df);
+        if (g_hAdv)
+            DeferWindowPos(hdwp, g_hAdv, NULL, m + SCALE(96) + gap, SCALE(6), SCALE(80), btnH, df);
+        if (g_hHeader)
+            DeferWindowPos(hdwp, g_hHeader, NULL, m, SCALE(40), w - 2 * m, SCALE(20), df);
+        if (g_hList)
+            DeferWindowPos(hdwp, g_hList, NULL, 0, listTop, w, (yBottom - gap) - listTop, df);
+        if (g_hStatus)
+            DeferWindowPos(hdwp, g_hStatus, NULL, m, yBottom + (btnH - SCALE(20)) / 2, rightEdge - m, SCALE(20), df);
+        EndDeferWindowPos(hdwp);
     }
 
-    if (g_hStatus) MoveWindow(g_hStatus, m, yBottom + (btnH - SCALE(20)) / 2,
-                              rightEdge - m, SCALE(20), TRUE);
-
-    update_scrollbar(h);
+    hdwp = BeginDeferWindowPos(g_rowCount * 7 + 8);
+    if (hdwp) {
+        const UINT df = SWP_NOZORDER | SWP_NOACTIVATE;
+        for (i = 0; i < g_rowCount; i++) {
+            /* 可视行按滚动定位; 屏外行统一移到固定屏外位置——否则大幅跳转(如拖到底)
+             * 后, 未重排的行会残留旧位置落入可视区。屏外行位置不变, Defer 为廉价空操作 */
+            int y = (i >= first && i <= last) ? SCALE(4) + i * rowH - g_scrollY : -4 * rowH;
+            if (g_name[i])
+                DeferWindowPos(hdwp, g_name[i], NULL, m, y + (lineH - SCALE(20)) / 2, nameW, SCALE(20), df);
+            if (g_edit[i])
+                DeferWindowPos(hdwp, g_edit[i], NULL, editX, y, editW, lineH, df);
+            if (g_browse[i])
+                DeferWindowPos(hdwp, g_browse[i], NULL, browseX, y, browseW, btnH, df);
+            if (g_install[i])
+                DeferWindowPos(hdwp, g_install[i], NULL, installX, y, installW, btnH, df);
+            if (g_test[i])
+                DeferWindowPos(hdwp, g_test[i], NULL, testX, y, testW, btnH, df);
+            if (g_remove[i])
+                DeferWindowPos(hdwp, g_remove[i], NULL, removeX, y, removeW, btnH, df);
+            if (g_rowStatus[i])
+                DeferWindowPos(hdwp, g_rowStatus[i], NULL, editX, y + lineH + SCALE(4), editW, SCALE(18), df);
+        }
+        EndDeferWindowPos(hdwp);
+    }
 }
 
 /* ---------- 后台自动检测 ---------- */
@@ -557,16 +595,19 @@ static LRESULT CALLBACK add_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
     switch (msg) {
     case WM_CREATE: {
         HINSTANCE hi = GetModuleHandleW(NULL);
+        HWND ed;
         CreateWindowExW(0, L"STATIC", L"命令名:", WS_CHILD | WS_VISIBLE,
             SCALE(12), SCALE(14), SCALE(70), SCALE(20), h, NULL, hi, NULL);
-        CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, SCALE(86), SCALE(12), SCALE(210), SCALE(22),
+        ed = CreateWindowExW(0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, SCALE(86), SCALE(12), SCALE(210), SCALE(22),
             h, (HMENU)IDC_AD_NAME, hi, NULL);
+        if (ed) SetWindowTheme(ed, L"Explorer", NULL);
         CreateWindowExW(0, L"STATIC", L"主程序:", WS_CHILD | WS_VISIBLE,
             SCALE(12), SCALE(44), SCALE(70), SCALE(20), h, NULL, hi, NULL);
-        CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, SCALE(86), SCALE(42), SCALE(210), SCALE(22),
+        ed = CreateWindowExW(0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, SCALE(86), SCALE(42), SCALE(210), SCALE(22),
             h, (HMENU)IDC_AD_PATH, hi, NULL);
+        if (ed) SetWindowTheme(ed, L"Explorer", NULL);
         CreateWindowExW(0, L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
             SCALE(302), SCALE(42), SCALE(80), SCALE(22), h, (HMENU)IDC_AD_BROWSE, hi, NULL);
         CreateWindowExW(0, L"BUTTON",
@@ -755,7 +796,6 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (si.nPos != oldPos) {
             g_scrollY = si.nPos;
             layout_controls(h);
-            InvalidateRect(h, NULL, TRUE);
         }
         return 0;
     }
@@ -773,7 +813,6 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (si.nPos != oldPos) {
             g_scrollY = si.nPos;
             layout_controls(h);
-            InvalidateRect(h, NULL, TRUE);
         }
         return 0;
     }
