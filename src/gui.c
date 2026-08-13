@@ -24,6 +24,7 @@ enum {
     IDC_REDETECT = 102,
     IDC_ADV = 103,
     IDC_STATUS = 104,
+    IDC_DEEPSCAN = 105,
     IDC_ROW_EDIT = 500,
     IDC_ROW_BROWSE = 600,
     IDC_ROW_INSTALL = 700,
@@ -38,7 +39,7 @@ enum {
     IDC_AD_CLI = 203
 };
 
-static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hStatus, g_hList;
+static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hDeepScan, g_hStatus, g_hList;
 static HWND *g_name, *g_edit, *g_browse, *g_install, *g_remove, *g_test, *g_rowStatus;
 static int g_rowCount = 0;
 static int g_activeRow = -1;
@@ -47,8 +48,11 @@ static const wchar_t *g_listClass = L"openin_list";
 static int g_addResult = 0;
 
 #define WM_APP_DETECT (WM_APP + 1)      /* 后台检测线程回填单行路径 */
+#define WM_APP_DEEPSCAN (WM_APP + 2)    /* 深度扫描线程回填全部预设路径 */
 static HANDLE g_detectThread = NULL;    /* 后台自动检测线程(仅主线程访问) */
 static volatile LONG g_detectStop = 0;  /* 通知后台线程停止 */
+static HANDLE g_deepThread = NULL;      /* 深度扫描线程 */
+static volatile LONG g_deepStop = 0;    /* 通知深度扫描线程停止 */
 
 /* ---------- UI 字体与 DPI(现代原生观感,根治高缩放下的字体扭曲) ---------- */
 static HFONT g_font = NULL;             /* 雅黑 UI 字体,随 DPI 重建 */
@@ -330,8 +334,10 @@ static void layout_controls(HWND h)
         /* 三段式:顶部菜单栏行(重新检测/高级)+ 标题固定,中部滚动面板裁剪行控件,底部状态固定 */
         if (g_hRedetect)
             DeferWindowPos(hdwp, g_hRedetect, NULL, m, SCALE(6), SCALE(96), btnH, df);
+        if (g_hDeepScan)
+            DeferWindowPos(hdwp, g_hDeepScan, NULL, m + SCALE(96) + gap, SCALE(6), SCALE(96), btnH, df);
         if (g_hAdv)
-            DeferWindowPos(hdwp, g_hAdv, NULL, m + SCALE(96) + gap, SCALE(6), SCALE(80), btnH, df);
+            DeferWindowPos(hdwp, g_hAdv, NULL, m + (SCALE(96) + gap) * 2, SCALE(6), SCALE(80), btnH, df);
         if (g_hHeader)
             DeferWindowPos(hdwp, g_hHeader, NULL, m, SCALE(40), w - 2 * m, SCALE(20), df);
         if (g_hList)
@@ -404,6 +410,40 @@ static void start_auto_detect(HWND h)
     InterlockedExchange(&g_detectStop, 0);
     g_detectThread = CreateThread(NULL, 0, detect_thread_fn, h, 0, NULL);
     if (!g_detectThread) g_detectThread = NULL;
+}
+
+/* ---------- 深度扫描(按钮触发,单遍遍历,剪枝控时) ---------- */
+static DWORD WINAPI deep_scan_thread_fn(LPVOID param)
+{
+    HWND h = (HWND)param;
+    int n = preset_count();
+    wchar_t(*found)[MAX_PATH] = (wchar_t(*)[MAX_PATH])
+        malloc((size_t)n * MAX_PATH * sizeof(wchar_t));
+    int count;
+
+    if (!found) return 0;
+    count = deep_scan_presets(found, &g_deepStop);
+    if (!PostMessageW(h, WM_APP_DEEPSCAN, (WPARAM)count, (LPARAM)found))
+        free(found);   /* 窗口已销毁,消息未入队 */
+    return 0;
+}
+
+/* 点击「深度扫描」: 起后台线程跑全量深扫,防重入 */
+static void start_deep_scan(HWND h)
+{
+    if (g_deepThread) {
+        if (WaitForSingleObject(g_deepThread, 0) == WAIT_OBJECT_0) {
+            CloseHandle(g_deepThread);
+            g_deepThread = NULL;   /* 上一个已结束,可复用 */
+        } else {
+            SetWindowTextW(g_hStatus, L"深度扫描正在进行,请稍候…");
+            return;
+        }
+    }
+    InterlockedExchange(&g_deepStop, 0);
+    g_deepThread = CreateThread(NULL, 0, deep_scan_thread_fn, h, 0, NULL);
+    if (!g_deepThread) g_deepThread = NULL;
+    SetWindowTextW(g_hStatus, L"正在深度扫描应用路径…");
 }
 
 static void refresh_rows(HWND h)
@@ -764,6 +804,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             WS_CHILD | WS_VISIBLE, 0, 0, 400, 20, h, NULL, hi, NULL);
         g_hRedetect = CreateWindowExW(0, L"BUTTON", L"重新检测",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 90, 26, h, (HMENU)IDC_REDETECT, hi, NULL);
+        g_hDeepScan = CreateWindowExW(0, L"BUTTON", L"深度扫描",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 90, 26, h, (HMENU)IDC_DEEPSCAN, hi, NULL);
         g_hAdv = CreateWindowExW(0, L"BUTTON", L"高级▾",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 70, 26, h, (HMENU)IDC_ADV, hi, NULL);
         g_hStatus = CreateWindowExW(0, L"STATIC", L"就绪",
@@ -837,6 +879,22 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         free(path);
         return 0;
     }
+    case WM_APP_DEEPSCAN: {
+        int count = (int)w, filled = 0, i;
+        wchar_t(*found)[MAX_PATH] = (wchar_t(*)[MAX_PATH])l;
+        wchar_t st[200];
+        for (i = 0; i < preset_count() && i < g_rowCount; i++) {
+            if (found[i][0] && g_edit && g_edit[i]
+                && GetWindowTextLengthW(g_edit[i]) == 0) {
+                SetWindowTextW(g_edit[i], found[i]);
+                filled++;
+            }
+        }
+        _snwprintf_s(st, 200, 199, L"深度扫描完成: 检出 %d 个预设路径,新填充 %d 行。", count, filled);
+        SetWindowTextW(g_hStatus, st);
+        free(found);
+        return 0;
+    }
     case WM_COMMAND:
         if (LOWORD(w) >= IDC_ROW_BROWSE && LOWORD(w) < IDC_ROW_BROWSE + g_rowCount) {
             browse_row(LOWORD(w) - IDC_ROW_BROWSE);
@@ -856,6 +914,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         switch (LOWORD(w)) {
         case IDC_REDETECT: re_detect_all(); return 0;
+        case IDC_DEEPSCAN: start_deep_scan(h); return 0;
         case IDC_ADV: show_adv_menu(h); return 0;
         case IDM_ADD:
             if (add_custom_dialog(h)) refresh_rows(h);
@@ -877,6 +936,12 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             WaitForSingleObject(g_detectThread, 3000);
             CloseHandle(g_detectThread);
             g_detectThread = NULL;
+        }
+        InterlockedExchange(&g_deepStop, 1);
+        if (g_deepThread) {
+            WaitForSingleObject(g_deepThread, 5000);
+            CloseHandle(g_deepThread);
+            g_deepThread = NULL;
         }
         destroy_rows();
         if (g_font) { DeleteObject(g_font); g_font = NULL; }

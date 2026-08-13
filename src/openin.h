@@ -50,6 +50,7 @@ BOOL find_in_path(const wchar_t *file, wchar_t *out, size_t out_sz);
 
 /* ---------- detect.c ---------- */
 BOOL detect_app(const wchar_t *exeName, wchar_t *out, size_t out_sz);
+int  deep_scan_presets(wchar_t found[][MAX_PATH], volatile LONG *stop);
 
 /* ---------- core.c ---------- */
 int  preset_count(void);

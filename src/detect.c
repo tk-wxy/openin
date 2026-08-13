@@ -192,3 +192,168 @@ BOOL detect_app(const wchar_t *exeName, wchar_t *out, size_t out_sz)
 {
     return detect_app_impl(exeName, out, out_sz, 0);
 }
+
+/* ---------- 深度扫描(按钮触发,单遍遍历 + 剪枝控时) ---------- */
+
+/* 目录名是否应跳过。driveRootLevel=1 表示在盘根层的直接子目录(额外跳过系统目录) */
+static BOOL dir_is_noisy(const wchar_t *name, BOOL driveRootLevel)
+{
+    static const wchar_t *always[] = {
+        L"node_modules", L".git", L".cache", L"target", L"__pycache__",
+        L".pnpm-store", L"AppData", NULL
+    };
+    static const wchar_t *driveOnly[] = {
+        L"Windows", L"ProgramData", L"Users", L"$Recycle.Bin",
+        L"System Volume Information", NULL
+    };
+    int i;
+
+    for (i = 0; always[i]; i++)
+        if (_wcsicmp(name, always[i]) == 0) return TRUE;
+    if (driveRootLevel)
+        for (i = 0; driveOnly[i]; i++)
+            if (_wcsicmp(name, driveOnly[i]) == 0) return TRUE;
+    return FALSE;
+}
+
+/*
+ * 单遍深扫: 遍历 root 子树,把文件基名与活动名单(names[]/name2row[])比对,
+ * 命中即写入 found[row] 并从名单交换剔除(缩小 *nActive)。
+ * 全部命中或 stop 被置 1 时返回 TRUE(提前退出整个遍历)。
+ */
+static BOOL scan_tree_multi(const wchar_t *root, int depth, int maxDepth,
+                            const wchar_t **names, int *nActive, int name2row[],
+                            wchar_t found[][MAX_PATH], volatile LONG *stop)
+{
+    wchar_t pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE hf;
+    int i;
+
+    if (stop && *stop) return TRUE;
+    if (*nActive <= 0) return TRUE;
+    if (depth > maxDepth) return FALSE;
+    _snwprintf_s(pat, MAX_PATH, MAX_PATH - 1, L"%s\\*", root);
+    hf = FindFirstFileW(pat, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (stop && *stop) break;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (fd.cFileName[0] == L'.' ||
+                wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+                continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;  /* 防 junction 循环 */
+            if (dir_is_noisy(fd.cFileName, depth == 0)) continue;
+            {
+                wchar_t sub[MAX_PATH];
+                _snwprintf_s(sub, MAX_PATH, MAX_PATH - 1, L"%s\\%s", root, fd.cFileName);
+                if (scan_tree_multi(sub, depth + 1, maxDepth, names, nActive, name2row, found, stop)) {
+                    FindClose(hf);
+                    return TRUE;
+                }
+            }
+        } else {
+            const wchar_t *dot;
+            if (*nActive <= 0) break;
+            dot = wcsrchr(fd.cFileName, L'.');
+            if (!dot) continue;
+            if (_wcsicmp(dot, L".exe") != 0 && _wcsicmp(dot, L".cmd") != 0) continue;
+            for (i = 0; i < *nActive; i++) {
+                if (_wcsicmp(fd.cFileName, names[i]) == 0) {
+                    int row = name2row[i];
+                    _snwprintf_s(found[row], MAX_PATH, MAX_PATH - 1, L"%s\\%s", root, fd.cFileName);
+                    names[i] = names[*nActive - 1];   /* 交换剔除,缩小活动名单 */
+                    name2row[i] = name2row[*nActive - 1];
+                    (*nActive)--;
+                    break;
+                }
+            }
+        }
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+    return *nActive <= 0;
+}
+
+/*
+ * 深度扫描全部预设主程序: 快源(App Paths 注册表/PATH)→ 单遍深扫目录
+ * (专属根深度 6、固定盘根深度 3,剪枝控时)。命中即从后续阶段剔除。
+ * found 为 preset_count() 行 × MAX_PATH 的缓冲,命中才非空;stop 置 1 可提前中止。
+ * 返回命中数。
+ */
+int deep_scan_presets(wchar_t found[][MAX_PATH], volatile LONG *stop)
+{
+    const int n = preset_count();
+    const wchar_t *names[2 * 64];
+    wchar_t alts[2 * 64][MAX_PATH];
+    int name2row[2 * 64];
+    int nActive = 0, count = 0, i;
+    wchar_t root[MAX_PATH];
+    DWORD drives;
+
+    for (i = 0; i < n; i++) found[i][0] = L'\0';
+
+    /* 1. 快源: App Paths 注册表 + PATH(零/低磁盘成本);与 detect_app 一致,主名失败再试扩展名交替 */
+    for (i = 0; i < n; i++) {
+        wchar_t *dot;
+        if (stop && *stop) break;
+        if (detect_app_registry(PRESETS[i].exeName, found[i], MAX_PATH) && path_exists(found[i]))
+            continue;
+        if (find_in_path(PRESETS[i].exeName, found[i], MAX_PATH))
+            continue;
+        /* 交替扩展名(.exe<->.cmd)再试注册表/PATH: 如 Cursor.exe 只以 Cursor.cmd 挂在 PATH */
+        wcscpy_s(root, MAX_PATH, PRESETS[i].exeName);
+        dot = wcsrchr(root, L'.');
+        if (dot && (_wcsicmp(dot, L".exe") == 0 || _wcsicmp(dot, L".cmd") == 0)) {
+            if (_wcsicmp(dot, L".exe") == 0) wcscpy_s(dot, 5, L".cmd");
+            else wcscpy_s(dot, 5, L".exe");
+            if (detect_app_registry(root, found[i], MAX_PATH) && path_exists(found[i]))
+                continue;
+            find_in_path(root, found[i], MAX_PATH);
+        }
+    }
+
+    /* 2. 收集仍未命中预设及其扩展名交替(.exe<->.cmd) */
+    for (i = 0; i < n; i++) {
+        wchar_t *dot;
+        if (found[i][0]) continue;
+        names[nActive] = PRESETS[i].exeName;
+        name2row[nActive] = i;
+        nActive++;
+        wcscpy_s(alts[nActive], MAX_PATH, PRESETS[i].exeName);
+        dot = wcsrchr(alts[nActive], L'.');
+        if (dot) {
+            if (_wcsicmp(dot, L".exe") == 0) wcscpy_s(dot, 5, L".cmd");
+            else if (_wcsicmp(dot, L".cmd") == 0) wcscpy_s(dot, 5, L".exe");
+            else continue;
+            names[nActive] = alts[nActive];
+            name2row[nActive] = i;
+            nActive++;
+        }
+    }
+    if (nActive <= 0) goto done;
+
+    /* 3. 单遍深扫: 专属根(深度 6) */
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", root, MAX_PATH)) {
+        _snwprintf_s(root, MAX_PATH, MAX_PATH - 1, L"%s\\Programs", root);
+        scan_tree_multi(root, 0, 6, names, &nActive, name2row, found, stop);
+    }
+    if (nActive > 0 && GetEnvironmentVariableW(L"ProgramFiles", root, MAX_PATH))
+        scan_tree_multi(root, 0, 6, names, &nActive, name2row, found, stop);
+    if (nActive > 0 && GetEnvironmentVariableW(L"ProgramFiles(x86)", root, MAX_PATH))
+        scan_tree_multi(root, 0, 6, names, &nActive, name2row, found, stop);
+
+    /* 4. 固定盘根(深度 3,剪枝) */
+    if (nActive > 0) {
+        drives = GetLogicalDrives();
+        for (i = 0; i < 26 && nActive > 0; i++) {
+            wchar_t drv[4] = { (wchar_t)(L'A' + i), L':', L'\\', 0 };
+            if ((drives & (1 << i)) && GetDriveTypeW(drv) == DRIVE_FIXED)
+                scan_tree_multi(drv, 0, 3, names, &nActive, name2row, found, stop);
+        }
+    }
+
+done:
+    for (i = 0; i < n; i++) if (found[i][0]) count++;
+    return count;
+}
+
