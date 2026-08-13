@@ -5,9 +5,11 @@
  */
 #define UNICODE
 #define _UNICODE
+#define _WIN32_WINNT 0x0A00   /* GetDpiForWindow / GetDpiForSystem / WM_DPICHANGED */
 
 #include <windows.h>
 #include <commdlg.h>
+#include <commctrl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -34,16 +36,58 @@ enum {
     IDC_AD_CLI = 203
 };
 
-static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hStatus;
+static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hStatus, g_hList;
 static HWND *g_name, *g_edit, *g_browse, *g_install, *g_remove, *g_rowStatus;
 static int g_rowCount = 0;
 static int g_activeRow = -1;
 static const wchar_t *g_winClass = L"openin_main";
+static const wchar_t *g_listClass = L"openin_list";
 static int g_addResult = 0;
 
 #define WM_APP_DETECT (WM_APP + 1)      /* 后台检测线程回填单行路径 */
 static HANDLE g_detectThread = NULL;    /* 后台自动检测线程(仅主线程访问) */
 static volatile LONG g_detectStop = 0;  /* 通知后台线程停止 */
+
+/* ---------- UI 字体与 DPI(现代原生观感,根治高缩放下的字体扭曲) ---------- */
+static HFONT g_font = NULL;             /* 雅黑 UI 字体,随 DPI 重建 */
+static int  g_dpi = 96;                 /* 当前窗口 DPI(manifest 声明 PerMonitorV2) */
+
+#define SCALE(x) MulDiv((x), g_dpi, 96) /* 96 DPI 基准像素 → 当前 DPI 物理像素 */
+
+/* 依窗口当前 DPI 重建雅黑 UI 字体;旧字体先释放防泄漏 */
+static void create_ui_font(HWND h)
+{
+    UINT dpi = GetDpiForWindow(h);
+    int height;
+    if (dpi == 0) dpi = 96;
+    g_dpi = (int)dpi;
+    if (g_font) { DeleteObject(g_font); g_font = NULL; }
+    height = -MulDiv(9, g_dpi, 72);     /* 9pt,逻辑像素随 DPI 缩放 */
+    g_font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                         L"Microsoft YaHei UI");   /* 缺失时 GDI 自动替换 */
+}
+
+static BOOL CALLBACK set_font_cb(HWND child, LPARAM l)
+{
+    SendMessageW(child, WM_SETFONT, (WPARAM)l, TRUE);
+    return TRUE;
+}
+
+/* 把 UI 字体应用到 root 下全部子控件(含后续重建的行控件) */
+static void apply_font(HWND root)
+{
+    if (g_font) EnumChildWindows(root, set_font_cb, (LPARAM)g_font);
+}
+
+/* 滚动列表面板:裁剪行控件、隔离固定底栏;按钮/编辑框通知转交主窗口统一处理 */
+static LRESULT CALLBACK list_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    if (msg == WM_COMMAND)
+        return SendMessageW(GetParent(h), msg, w, l);
+    return DefWindowProcW(h, msg, w, l);
+}
 
 
 /* 目标总数 = 预设 + 非预设自定义 */
@@ -216,17 +260,21 @@ static void update_status(int row)
 static void update_scrollbar(HWND h)
 {
     RECT rc;
-    GetClientRect(h, &rc);
-    int totalH = 36 + g_rowCount * 62 + 40;
-    int clientH = rc.bottom - rc.top;
-
+    int m = SCALE(16), btnH = SCALE(28), gap = SCALE(8), listTop = SCALE(44);
+    int clientH, viewportH, contentH;
     SCROLLINFO si;
+
+    GetClientRect(h, &rc);
+    clientH = rc.bottom - rc.top;
+    viewportH = (clientH - m - btnH - gap) - listTop;   /* 可视列表高度(滚动面板高) */
+    contentH = g_rowCount * SCALE(64) + SCALE(8);       /* 全部行内容高度 */
+
     ZeroMemory(&si, sizeof(si));
     si.cbSize = sizeof(si);
     si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
     si.nMin = 0;
-    si.nMax = totalH;
-    si.nPage = (UINT)(clientH > 0 ? clientH : 1);
+    si.nMax = contentH;
+    si.nPage = (UINT)(viewportH > 0 ? viewportH : 1);
     si.nPos = g_scrollY;
     SetScrollInfo(h, SB_VERT, &si, TRUE);
 }
@@ -234,29 +282,46 @@ static void update_scrollbar(HWND h)
 static void layout_controls(HWND h)
 {
     RECT rc;
-    int m = 10, rowH = 62, top = 36;
-    int w, yBottom, i;
+    int m = SCALE(16), rowH = SCALE(64), gap = SCALE(8);
+    int nameW = SCALE(150);
+    int browseW = SCALE(64), installW = SCALE(96), removeW = SCALE(56);
+    int btnH = SCALE(28), lineH = SCALE(28);
+    int listTop = SCALE(44);
+    int w, clientH, yBottom, i;
+    int rightEdge, removeX, installX, browseX, editX, editW;
 
     GetClientRect(h, &rc);
     w = rc.right - rc.left;
-    yBottom = rc.bottom - m - 26;
+    clientH = rc.bottom - rc.top;
+    rightEdge = w - m;
+    removeX = rightEdge - removeW;
+    installX = removeX - gap - installW;
+    browseX = installX - gap - browseW;
+    editX = m + nameW + gap;
+    editW = browseX - gap - editX;
+    yBottom = clientH - m - btnH;
 
+    /* 三段式:顶部标题固定,中部滚动面板裁剪行控件,底部按钮/状态固定——互不重叠 */
     if (g_hHeader)
-        MoveWindow(g_hHeader, m, 8 - g_scrollY, w - 2 * m, 20, TRUE);
+        MoveWindow(g_hHeader, m, SCALE(12), w - 2 * m, SCALE(22), TRUE);
+    if (g_hList)
+        MoveWindow(g_hList, 0, listTop, w, (yBottom - gap) - listTop, TRUE);
 
     for (i = 0; i < g_rowCount; i++) {
-        int y = top + i * rowH - g_scrollY;
-        if (g_name[i]) MoveWindow(g_name[i], m, y + 2, 120, 20, TRUE);
-        if (g_edit[i]) MoveWindow(g_edit[i], 135, y, w - 135 - 225, 22, TRUE);
-        if (g_browse[i]) MoveWindow(g_browse[i], w - 225, y - 2, 60, 24, TRUE);
-        if (g_install[i]) MoveWindow(g_install[i], w - 160, y - 3, 90, 26, TRUE);
-        if (g_remove[i]) MoveWindow(g_remove[i], w - 62, y - 2, 50, 24, TRUE);
-        if (g_rowStatus[i]) MoveWindow(g_rowStatus[i], 135, y + 26, w - 135 - 20, 18, TRUE);
+        int y = SCALE(4) + i * rowH - g_scrollY;   /* 相对列表面板,越界由面板裁剪 */
+        if (g_name[i]) MoveWindow(g_name[i], m, y + (lineH - SCALE(20)) / 2, nameW, SCALE(20), TRUE);
+        if (g_edit[i]) MoveWindow(g_edit[i], editX, y, editW, lineH, TRUE);
+        if (g_browse[i]) MoveWindow(g_browse[i], browseX, y, browseW, btnH, TRUE);
+        if (g_install[i]) MoveWindow(g_install[i], installX, y, installW, btnH, TRUE);
+        if (g_remove[i]) MoveWindow(g_remove[i], removeX, y, removeW, btnH, TRUE);
+        if (g_rowStatus[i]) MoveWindow(g_rowStatus[i], editX, y + lineH + SCALE(4), editW, SCALE(18), TRUE);
     }
 
-    if (g_hRedetect) MoveWindow(g_hRedetect, m, yBottom, 90, 26, TRUE);
-    if (g_hAdv) MoveWindow(g_hAdv, 108, yBottom, 70, 26, TRUE);
-    if (g_hStatus) MoveWindow(g_hStatus, 188, yBottom, w - 198, 26, TRUE);
+    if (g_hRedetect) MoveWindow(g_hRedetect, m, yBottom, SCALE(96), btnH, TRUE);
+    if (g_hAdv) MoveWindow(g_hAdv, m + SCALE(96) + gap, yBottom, SCALE(80), btnH, TRUE);
+    if (g_hStatus) MoveWindow(g_hStatus, m + SCALE(96) + gap + SCALE(80) + gap,
+                              yBottom + (btnH - SCALE(20)) / 2,
+                              rightEdge - (m + SCALE(96) + gap + SCALE(80) + gap), SCALE(20), TRUE);
 
     update_scrollbar(h);
 }
@@ -303,12 +368,13 @@ static void start_auto_detect(HWND h)
 static void refresh_rows(HWND h)
 {
     int i;
-    build_rows(h);
+    build_rows(g_hList);   /* 行控件挂在滚动面板内,由面板裁剪、隔离底栏 */
     layout_controls(h);
     for (i = 0; i < g_rowCount; i++)
         update_status(i);
     for (i = preset_count(); i < g_rowCount; i++)
         fill_path(i);   /* 自定义行: 从会话记录恢复路径,免二次填写 */
+    apply_font(h);      /* 重建的行控件统一应用雅黑字体 */
     start_auto_detect(h);   /* 后台逐行回填预设路径,窗口无需等待 */
 }
 
@@ -432,24 +498,26 @@ static LRESULT CALLBACK add_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
     switch (msg) {
     case WM_CREATE: {
         HINSTANCE hi = GetModuleHandleW(NULL);
-        CreateWindowExW(0, L"STATIC", L"命令名:", WS_CHILD | WS_VISIBLE, 12, 14, 70, 20, h, NULL, hi, NULL);
+        CreateWindowExW(0, L"STATIC", L"命令名:", WS_CHILD | WS_VISIBLE,
+            SCALE(12), SCALE(14), SCALE(70), SCALE(20), h, NULL, hi, NULL);
         CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 86, 12, 210, 22,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, SCALE(86), SCALE(12), SCALE(210), SCALE(22),
             h, (HMENU)IDC_AD_NAME, hi, NULL);
-        CreateWindowExW(0, L"STATIC", L"主程序:", WS_CHILD | WS_VISIBLE, 12, 44, 70, 20, h, NULL, hi, NULL);
+        CreateWindowExW(0, L"STATIC", L"主程序:", WS_CHILD | WS_VISIBLE,
+            SCALE(12), SCALE(44), SCALE(70), SCALE(20), h, NULL, hi, NULL);
         CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 86, 42, 210, 22,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, SCALE(86), SCALE(42), SCALE(210), SCALE(22),
             h, (HMENU)IDC_AD_PATH, hi, NULL);
         CreateWindowExW(0, L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            302, 42, 80, 22, h, (HMENU)IDC_AD_BROWSE, hi, NULL);
+            SCALE(302), SCALE(42), SCALE(80), SCALE(22), h, (HMENU)IDC_AD_BROWSE, hi, NULL);
         CreateWindowExW(0, L"BUTTON",
             L"命令行工具 (CLI: 继承 cwd, 经 Windows Terminal 打开可见终端)",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            12, 74, 390, 22, h, (HMENU)IDC_AD_CLI, hi, NULL);
+            SCALE(12), SCALE(74), SCALE(390), SCALE(22), h, (HMENU)IDC_AD_CLI, hi, NULL);
         CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            170, 120, 80, 28, h, (HMENU)IDOK, hi, NULL);
+            SCALE(170), SCALE(120), SCALE(80), SCALE(28), h, (HMENU)IDOK, hi, NULL);
         CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            270, 120, 80, 28, h, (HMENU)IDCANCEL, hi, NULL);
+            SCALE(270), SCALE(120), SCALE(80), SCALE(28), h, (HMENU)IDCANCEL, hi, NULL);
         SetFocus(GetDlgItem(h, IDC_AD_NAME));
         return 0;
     }
@@ -536,12 +604,13 @@ static int add_custom_dialog(HWND parent)
 
     h = CreateWindowExW(0, cls, L"添加自定义目标",
                         WS_CAPTION | WS_SYSMENU | WS_POPUP,
-                        CW_USEDEFAULT, CW_USEDEFAULT, 400, 200,
+                        CW_USEDEFAULT, CW_USEDEFAULT, SCALE(430), SCALE(220),
                         parent, NULL, wc.hInstance, NULL);
     if (!h) return 0;
     g_addResult = 0;
     ShowWindow(h, SW_SHOW);
     UpdateWindow(h);
+    apply_font(h);   /* 添加对话框各控件应用雅黑字体 */
 
     EnableWindow(parent, FALSE);
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -589,6 +658,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_CREATE: {
         HINSTANCE hi = GetModuleHandleW(NULL);
         g_hMain = h;
+        create_ui_font(h);   /* 先确定 g_dpi,供布局 SCALE 与字体使用 */
         g_hHeader = CreateWindowExW(0, L"STATIC",
             L"可用应用（路径自动检测，确认后点「安装」）：",
             WS_CHILD | WS_VISIBLE, 0, 0, 400, 20, h, NULL, hi, NULL);
@@ -598,6 +668,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 70, 26, h, (HMENU)IDC_ADV, hi, NULL);
         g_hStatus = CreateWindowExW(0, L"STATIC", L"就绪",
             WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 0, 0, 400, 26, h, (HMENU)IDC_STATUS, hi, NULL);
+        g_hList = CreateWindowExW(0, g_listClass, L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 100, 100, h, NULL, hi, NULL);
         refresh_rows(h);
         return 0;
     }
@@ -644,6 +716,17 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             layout_controls(h);
             InvalidateRect(h, NULL, TRUE);
         }
+        return 0;
+    }
+    case WM_DPICHANGED: {
+        RECT *prc = (RECT *)l;   /* 系统建议的新窗口矩形 */
+        create_ui_font(h);       /* 按新 DPI 重建字体并更新 g_dpi */
+        apply_font(h);
+        if (prc)
+            SetWindowPos(h, NULL, prc->left, prc->top,
+                         prc->right - prc->left, prc->bottom - prc->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        layout_controls(h);
         return 0;
     }
     case WM_APP_DETECT: {
@@ -694,6 +777,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             g_detectThread = NULL;
         }
         destroy_rows();
+        if (g_font) { DeleteObject(g_font); g_font = NULL; }
         PostQuitMessage(0);
         return 0;
     }
@@ -708,6 +792,10 @@ int gui_main(void)
 
     pick_target_dir(NULL, g_installDir, MAX_PATH);   /* 无状态: 每次自动选择安装目录 */
 
+    InitCommonControls();                 /* 配合 v6 manifest 启用现代主题控件 */
+    g_dpi = (int)GetDpiForSystem();       /* 先用系统 DPI 估算初始窗口尺寸 */
+    if (g_dpi <= 0) g_dpi = 96;
+
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = main_wnd_proc;
     wc.hInstance = GetModuleHandleW(NULL);
@@ -717,9 +805,17 @@ int gui_main(void)
     wc.lpszClassName = g_winClass;
     RegisterClassW(&wc);
 
+    ZeroMemory(&wc, sizeof(wc));          /* 滚动列表面板:裁剪行控件、隔离底栏 */
+    wc.lpfnWndProc = list_wnd_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = g_listClass;
+    RegisterClassW(&wc);
+
     hwnd = CreateWindowExW(0, g_winClass, L"openin — 打开到应用",
-                           WS_OVERLAPPEDWINDOW | WS_VSCROLL,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 720, 520,
+                           WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_CLIPCHILDREN,
+                           CW_USEDEFAULT, CW_USEDEFAULT, SCALE(760), SCALE(560),
                            NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) return 1;
     ShowWindow(hwnd, SW_SHOW);
