@@ -44,30 +44,40 @@ static BOOL path_value_contains(const wchar_t *value, const wchar_t *dir)
     return FALSE;
 }
 
+/* 读取用户 PATH 值(type 原样保留;无值视为空,成功返回 TRUE;读取错误返回 FALSE) */
+static BOOL read_user_path_value(DWORD *type, wchar_t **val)
+{
+    DWORD size = 0;
+    LONG r;
+
+    *val = NULL;
+    r = RegGetValueW(HKEY_CURRENT_USER, L"Environment", L"Path",
+                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, type, NULL, &size);
+    if (r == ERROR_SUCCESS && size > 0) {
+        wchar_t *v = (wchar_t *)malloc(size + sizeof(wchar_t));
+        if (!v) return FALSE;
+        if (RegGetValueW(HKEY_CURRENT_USER, L"Environment", L"Path",
+                         RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                         type, v, &size) != ERROR_SUCCESS) {
+            free(v);
+            return FALSE;
+        }
+        v[size / sizeof(wchar_t)] = L'\0';
+        *val = v;
+        return TRUE;
+    }
+    return r == ERROR_FILE_NOT_FOUND;
+}
+
 BOOL add_to_user_path(const wchar_t *dir)
 {
-    DWORD type = REG_EXPAND_SZ, size = 0;
+    DWORD type = REG_EXPAND_SZ;
     wchar_t *val = NULL, *newval = NULL;
     size_t oldlen, dirlen;
     BOOL ok = FALSE;
-    LONG r;
     HKEY hk;
 
-    r = RegGetValueW(HKEY_CURRENT_USER, L"Environment", L"Path",
-                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &type, NULL, &size);
-    if (r == ERROR_SUCCESS && size > 0) {
-        val = (wchar_t *)malloc(size + sizeof(wchar_t));
-        if (!val) return FALSE;
-        if (RegGetValueW(HKEY_CURRENT_USER, L"Environment", L"Path",
-                         RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
-                         &type, val, &size) != ERROR_SUCCESS) {
-            free(val);
-            return FALSE;
-        }
-        val[size / sizeof(wchar_t)] = L'\0';
-    } else if (r != ERROR_FILE_NOT_FOUND) {
-        return FALSE;
-    }
+    if (!read_user_path_value(&type, &val)) return FALSE;
 
     if (val && path_value_contains(val, dir)) {           /* 已在 PATH 中 */
         free(val);
@@ -96,6 +106,77 @@ BOOL add_to_user_path(const wchar_t *dir)
         RegCloseKey(hk);
     }
     free(newval);
+
+    /* 广播环境变更,让 Explorer 和已打开的资源管理器刷新 */
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                        (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
+    return ok;
+}
+
+/* 从用户 PATH 中移除 dir 条目(与 add_to_user_path 镜像,幂等;只撤自己追加的那份) */
+BOOL remove_from_user_path(const wchar_t *dir)
+{
+    DWORD type = REG_EXPAND_SZ;
+    wchar_t *val = NULL, *newval = NULL;
+    wchar_t dirmod[MAX_PATH];
+    HKEY hk;
+    BOOL ok = FALSE, removed = FALSE;
+    size_t outlen = 0, dlen;
+
+    if (!read_user_path_value(&type, &val)) return FALSE;
+    if (!val || !path_value_contains(val, dir)) {
+        free(val);
+        return TRUE;                                     /* 无此条目,无事可做 */
+    }
+
+    /* 匹配语义与 path_value_contains 一致: 去尾反斜杠 + 忽略大小写,不剥引号 */
+    wcscpy_s(dirmod, MAX_PATH, dir);
+    dlen = wcslen(dirmod);
+    while (dlen > 0 && dirmod[dlen - 1] == L'\\') dirmod[--dlen] = L'\0';
+
+    newval = (wchar_t *)malloc((wcslen(val) + 2) * sizeof(wchar_t));
+    if (!newval) { free(val); return FALSE; }
+    newval[0] = L'\0';
+
+    {
+        const wchar_t *p = val;
+        while (*p) {
+            const wchar_t *end = wcschr(p, L';');
+            size_t seglen = end ? (size_t)(end - p) : wcslen(p);
+            size_t len = seglen;                          /* 匹配比较用,截断到缓冲 */
+            wchar_t entry[MAX_PATH];
+            size_t i, elen;
+
+            if (len >= MAX_PATH) len = MAX_PATH - 1;
+            for (i = 0; i < len; i++) entry[i] = p[i];
+            entry[len] = L'\0';
+
+            elen = wcslen(entry);
+            while (elen > 0 && entry[elen - 1] == L'\\') entry[--elen] = L'\0';
+
+            if (!removed && entry[0] && _wcsicmp(entry, dirmod) == 0) {
+                removed = TRUE;                          /* 删除首个匹配条目 */
+            } else {
+                if (outlen > 0) newval[outlen++] = L';'; /* 其余条目原样保留(含空条目),不截断 */
+                memcpy(newval + outlen, p, seglen * sizeof(wchar_t));
+                outlen += seglen;
+                newval[outlen] = L'\0';
+            }
+            if (!end) break;
+            p = end + 1;
+        }
+    }
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0,
+                      KEY_SET_VALUE, &hk) == ERROR_SUCCESS) {
+        if (RegSetValueExW(hk, L"Path", 0, type,
+                           (const BYTE *)newval,
+                           (DWORD)((wcslen(newval) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS)
+            ok = TRUE;
+        RegCloseKey(hk);
+    }
+    free(newval);
+    free(val);
 
     /* 广播环境变更,让 Explorer 和已打开的资源管理器刷新 */
     SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,

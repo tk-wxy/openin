@@ -118,6 +118,156 @@ static BOOL write_launcher_binary(const wchar_t *codeExe, int cli, const wchar_t
     return ok;
 }
 
+/* ---------- openin 归属识别与撤销标记 ---------- */
+#define UNDO_MARKER_NAME L".openin-undo"
+
+/* 文件内容是否包含指定字节串(.cmd 按 ANSI/GBK 写出,ASCII 子串字节一致) */
+static BOOL file_contains_bytes(const wchar_t *path, const char *needle, size_t needle_len)
+{
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    BOOL found = FALSE;
+    DWORD sz = GetFileSize(h, NULL);
+    if (sz > 0 && sz < 8 * 1024 * 1024) {
+        char *buf = (char *)malloc((size_t)sz);
+        if (buf) {
+            DWORD rd = 0;
+            if (ReadFile(h, buf, sz, &rd, NULL) && rd == sz) {
+                for (DWORD i = 0; i + needle_len <= rd; i++)
+                    if (memcmp(buf + i, needle, needle_len) == 0) { found = TRUE; break; }
+            }
+            free(buf);
+        }
+    }
+    CloseHandle(h);
+    return found;
+}
+
+/* .cmd 是否为 openin 生成的 launcher(含 "openin launcher" 注释) */
+static BOOL cmd_is_openin(const wchar_t *cmdPath)
+{
+    static const char sig[] = "openin launcher";
+    return path_exists(cmdPath) &&
+           file_contains_bytes(cmdPath, sig, sizeof(sig) - 1);
+}
+
+/* .exe 是否为 openin 生成的 launcher(含 L"Failed to start:" 的 UTF-16LE 字节,四变体皆有) */
+static BOOL exe_is_openin(const wchar_t *exePath)
+{
+    static const unsigned char sig[] = {
+        'F',0, 'a',0, 'i',0, 'l',0, 'e',0, 'd',0, ' ',0,
+        't',0, 'o',0, ' ',0, 's',0, 't',0, 'a',0, 'r',0, 't',0, ':',0
+    };
+    return path_exists(exePath) &&
+           file_contains_bytes(exePath, (const char *)sig, sizeof(sig));
+}
+
+/* 目标文件是否为 openin 生成的 launcher(按扩展名分派) */
+static BOOL is_openin_launcher(const wchar_t *path)
+{
+    const wchar_t *ext = wcsrchr(path, L'.');
+    if (ext && (_wcsicmp(ext, L".cmd") == 0 || _wcsicmp(ext, L".bat") == 0))
+        return cmd_is_openin(path);
+    return exe_is_openin(path);
+}
+
+/* 写撤销标记(path-added/dir-created 仅记录实际发生的事实);失败返回 FALSE */
+static BOOL write_undo_marker(const wchar_t *dir, BOOL pathAdded, BOOL dirCreated)
+{
+    wchar_t path[MAX_PATH];
+    char buf[64];
+    int n;
+    HANDLE h;
+    DWORD written = 0;
+
+    _snwprintf_s(path, MAX_PATH, MAX_PATH - 1, L"%s\\%s", dir, UNDO_MARKER_NAME);
+    n = _snprintf_s(buf, 64, 63, "path-added=%d\ndir-created=%d\n",
+                    pathAdded ? 1 : 0, dirCreated ? 1 : 0);
+    if (n <= 0) return FALSE;
+    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    BOOL ok = WriteFile(h, buf, (DWORD)n, &written, NULL) && written == (DWORD)n;
+    CloseHandle(h);
+    return ok;
+}
+
+/* 读撤销标记;文件不存在或解析失败返回 FALSE(调用方按「无标记」保守处理) */
+static BOOL read_undo_marker(const wchar_t *dir, BOOL *pathAdded, BOOL *dirCreated)
+{
+    wchar_t path[MAX_PATH];
+    HANDLE h;
+    char buf[64] = { 0 };
+    DWORD rd = 0;
+
+    *pathAdded = FALSE;
+    *dirCreated = FALSE;
+    _snwprintf_s(path, MAX_PATH, MAX_PATH - 1, L"%s\\%s", dir, UNDO_MARKER_NAME);
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    if (!ReadFile(h, buf, 63, &rd, NULL)) { CloseHandle(h); return FALSE; }
+    buf[rd] = '\0';
+    CloseHandle(h);
+    *pathAdded = (strstr(buf, "path-added=1") != NULL);
+    *dirCreated = (strstr(buf, "dir-created=1") != NULL);
+    return TRUE;
+}
+
+static void delete_undo_marker(const wchar_t *dir)
+{
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, MAX_PATH, MAX_PATH - 1, L"%s\\%s", dir, UNDO_MARKER_NAME);
+    DeleteFileW(path);
+}
+
+/* 目录里是否还有 openin 生成的 launcher */
+static BOOL dir_has_openin_launcher(const wchar_t *dir)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    wchar_t pat[MAX_PATH], fp[MAX_PATH];
+
+    _snwprintf_s(pat, MAX_PATH, MAX_PATH - 1, L"%s\\*", dir);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        const wchar_t *ext = wcsrchr(fd.cFileName, L'.');
+        if (!ext) continue;
+        if (_wcsicmp(ext, L".cmd") != 0 && _wcsicmp(ext, L".bat") != 0 &&
+            _wcsicmp(ext, L".exe") != 0)
+            continue;
+        _snwprintf_s(fp, MAX_PATH, MAX_PATH - 1, L"%s\\%s", dir, fd.cFileName);
+        if (is_openin_launcher(fp)) { FindClose(h); return TRUE; }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return FALSE;
+}
+
+/* 目录是否为空(忽略 ./.. 与撤销标记自身) */
+static BOOL dir_effectively_empty(const wchar_t *dir)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    wchar_t pat[MAX_PATH];
+    BOOL any = FALSE;
+
+    _snwprintf_s(pat, MAX_PATH, MAX_PATH - 1, L"%s\\*", dir);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return TRUE;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+        if (_wcsicmp(fd.cFileName, UNDO_MARKER_NAME) == 0)
+            continue;
+        any = TRUE;
+        break;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return !any;
+}
+
 /* ---------- 生成 launcher 源码 ---------- */
 /*
  * 生成的 launcher: 启动主程序打开「当前工作目录」或命令行参数指定路径。
@@ -416,13 +566,15 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     wchar_t cmdline[1024], logBuf[4096];
     wchar_t conflictPath[MAX_PATH], gccPath[MAX_PATH];
     int exeBuilt = 0, pathAlready = 0, conflict = 0, compileFailed = 0;
+    BOOL dirCreated = FALSE;
 
     /* CLI 工具: 写入 App Paths 注册表(HKCU),实现地址栏/终端分离
        - 地址栏 'codex' → ShellExecuteEx 查 App Paths → 启动 openin launcher
        - 终端 'codex' → SearchPath 仅查 PATH → 运行原生 CLI(不受影响)
        - 卸载时清理注册表键,零残留 */
 
-    /* 确保安装目录存在(-p 可能指向尚未创建的目录) */
+    /* 确保安装目录存在(-p 可能指向尚未创建的目录);记录是否由 openin 创建(供卸载还原) */
+    dirCreated = !path_exists(installDir);
     CreateDirectoryW(installDir, NULL);
 
     _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
@@ -436,6 +588,30 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     }
     _snwprintf_s(srcPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.c", tempDir, name);
     _snwprintf_s(logPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s-build.log", tempDir, name);
+
+    /* 覆盖保护: 已存在同名文件且不是 openin 生成的,拒绝覆盖(防误毁真实工具) */
+    {
+        BOOL cmdExists = path_exists(cmdPath);
+        BOOL exeExists = path_exists(exePath);
+        if (cmdExists && !cmd_is_openin(cmdPath)) {
+            _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                         L"已存在同名文件,且不是 openin 生成的,拒绝覆盖:\n%s\n\n请先处理该文件再安装。",
+                         cmdPath);
+            return 1;
+        }
+        if (exeExists && !cmdExists) {
+            _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                         L"已存在同名 .exe(可能是真实工具),且没有 openin 的 .cmd 配对,拒绝覆盖:\n%s",
+                         exePath);
+            return 1;
+        }
+        if (cmdExists && cmd_is_openin(cmdPath) && exeExists && !exe_is_openin(exePath)) {
+            _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                         L"检测到 openin 的 .cmd 已存在,但同名 .exe 不是 openin 生成的(可能被替换),拒绝覆盖:\n%s",
+                         exePath);
+            return 1;
+        }
+    }
 
     /* .cmd 备用启动器(无需编译器,始终生成) */
     if (!write_launcher_cmd(codeExe, cli, cmdPath)) {
@@ -463,6 +639,28 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
         /* 临时源码与编译日志用完即删,目标目录零残留 */
         DeleteFileW(srcPath);
         DeleteFileW(logPath);
+    }
+
+    /* 撤销标记: 先写标记、后改 PATH——「PATH 被改 ⟹ 标记存在」的不变量,标记写失败则跳过加 PATH */
+    {
+        BOOL pathWillAdd = !path_in_environment(installDir);
+        BOOL oldPath = FALSE, oldDir = FALSE;
+        if (read_undo_marker(installDir, &oldPath, &oldDir)) {
+            pathWillAdd = pathWillAdd || oldPath;   /* 单调合并,防后续 install 覆盖丢 dir-created */
+            dirCreated = dirCreated || oldDir;
+        }
+        if (pathWillAdd || dirCreated) {
+            if (!write_undo_marker(installDir, pathWillAdd, dirCreated)) {
+                if (pathWillAdd) {
+                    _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                                 L"已生成,但写入撤销标记失败,为避免不可撤销的 PATH 改动,已跳过自动加 PATH。\n"
+                                 L"请手动把该目录加入用户 PATH:\n%s",
+                                 installDir);
+                    return 1;
+                }
+                /* 仅 dir-created 而标记写失败: 不阻断安装(空目录残留可接受) */
+            }
+        }
     }
 
     /* PATH: 目录已在 PATH 中则无需修改 */
@@ -531,17 +729,35 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
     return 0;
 }
 
-/* 卸载目标: 删除 launcher 文件 + 清理 App Paths 注册表(CLI) */
+/* 卸载目标: 按归属删 launcher + 清理 App Paths;最后一个 launcher 时撤销 PATH 追加与目录创建 */
 int uninstall_target(const wchar_t *name, const wchar_t *installDir,
                      wchar_t *outSummary, size_t sumSz)
 {
     wchar_t exePath[MAX_PATH], cmdPath[MAX_PATH], subKey[300];
-    BOOL any = FALSE;
+    BOOL any = FALSE, cmdExists, exeExists, cmdOwned, exeOwned;
 
     _snwprintf_s(exePath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.exe", installDir, name);
     _snwprintf_s(cmdPath, MAX_PATH, MAX_PATH - 1, L"%s\\%s.cmd", installDir, name);
-    if (DeleteFileW(exePath)) any = TRUE;
-    if (DeleteFileW(cmdPath)) any = TRUE;
+
+    /* 归属检查: 只动 openin 生成的文件,防误删真实工具 */
+    cmdExists = path_exists(cmdPath);
+    exeExists = path_exists(exePath);
+    cmdOwned = cmd_is_openin(cmdPath);
+    exeOwned = exe_is_openin(exePath);
+
+    if (cmdExists && !cmdOwned) {
+        _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                     L"\"%s\" 不是 openin 生成的(已存在同名 .cmd),拒绝删除:\n%s", name, cmdPath);
+        return 1;
+    }
+    if (exeExists && !cmdExists && !exeOwned) {
+        _snwprintf_s(outSummary, sumSz, sumSz - 1,
+                     L"\"%s\" 的 .exe 已存在但不是 openin 生成的,拒绝删除:\n%s", name, exePath);
+        return 1;
+    }
+
+    if (cmdOwned) { if (DeleteFileW(cmdPath)) any = TRUE; }
+    if (exeOwned) { if (DeleteFileW(exePath)) any = TRUE; }
 
     /* 清理 App Paths 注册表(CLI 目标,失败忽略) */
     _snwprintf_s(subKey, 300, 299,
@@ -554,6 +770,38 @@ int uninstall_target(const wchar_t *name, const wchar_t *installDir,
     }
 
     _snwprintf_s(outSummary, sumSz, sumSz - 1, L"已卸载 \"%s\"。", name);
+    if (cmdOwned && exeExists && !exeOwned) {
+        wchar_t warn[640];
+        _snwprintf_s(warn, 640, 639, L"\n⚠ 同名 .exe 不是 openin 生成的,已保留:\n%s", exePath);
+        wcscat_s(outSummary, sumSz, warn);
+    }
+
+    /* 撤销该目录的 PATH 追加与目录创建(仅当已无其他 openin launcher) */
+    if (!dir_has_openin_launcher(installDir)) {
+        BOOL pathAdded = FALSE, dirCreated = FALSE;
+        if (read_undo_marker(installDir, &pathAdded, &dirCreated)) {
+            if (dir_effectively_empty(installDir)) {
+                if (pathAdded) {
+                    if (remove_from_user_path(installDir))
+                        wcscat_s(outSummary, sumSz, L"\n已从用户 PATH 移除安装目录。");
+                    else
+                        wcscat_s(outSummary, sumSz, L"\n⚠ 从用户 PATH 移除安装目录失败。");
+                }
+                delete_undo_marker(installDir);
+                if (dirCreated) {
+                    if (RemoveDirectoryW(installDir))
+                        wcscat_s(outSummary, sumSz, L"\n已删除 openin 创建的空目录。");
+                    else
+                        wcscat_s(outSummary, sumSz, L"\n⚠ 删除安装目录失败(可能被占用)。");
+                }
+            } else {
+                delete_undo_marker(installDir);
+                wcscat_s(outSummary, sumSz, L"\n安装目录非空(有其他文件),PATH 条目与目录已保留。");
+            }
+        } else {
+            wcscat_s(outSummary, sumSz, L"\n未找到撤销标记,目录与 PATH 保留。");
+        }
+    }
     return 0;
 }
 

@@ -43,6 +43,7 @@ int  valid_name(const wchar_t *s);
 
 /* ---------- pathenv.c ---------- */
 BOOL add_to_user_path(const wchar_t *dir);
+BOOL remove_from_user_path(const wchar_t *dir);
 BOOL path_in_environment(const wchar_t *dir);
 void pick_target_dir(const wchar_t *override, wchar_t *out, size_t out_sz);
 BOOL find_in_path(const wchar_t *file, wchar_t *out, size_t out_sz);
