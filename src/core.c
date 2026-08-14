@@ -935,7 +935,6 @@ const Preset PRESETS[] = {
     { L"claude",   L"claude.exe",        L"Claude Code",     1, 1 },
     { L"codex",    L"codex.cmd",         L"Codex",           1, 0 },
     { L"opencode", L"opencode.cmd",      L"OpenCode",        1, 0 },
-    { L"wt",       L"wt.exe",            L"Windows Terminal",0, 0 },
     { L"pycharm",  L"pycharm64.exe",     L"PyCharm",         0, 0 },
     { L"webstorm", L"webstorm64.exe",    L"WebStorm",        0, 0 },
     { L"goland",   L"goland64.exe",      L"GoLand",          0, 0 },
