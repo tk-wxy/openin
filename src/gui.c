@@ -32,7 +32,6 @@ enum {
     IDC_ROW_TEST = 900,
     IDC_ROW_UNINSTALL = 1000,
     IDM_ADD = 401,
-    IDM_UNINSTALL = 402,
     IDM_ABOUT = 405,
     IDC_AD_NAME = 200,
     IDC_AD_PATH = 201,
@@ -43,7 +42,6 @@ enum {
 static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hDeepScan, g_hStatus, g_hList;
 static HWND *g_name, *g_edit, *g_browse, *g_install, *g_remove, *g_test, *g_uninstall, *g_rowStatus;
 static int g_rowCount = 0;
-static int g_activeRow = -1;
 static const wchar_t *g_winClass = L"openin_main";
 static const wchar_t *g_listClass = L"openin_list";
 static int g_addResult = 0;
@@ -488,7 +486,6 @@ static void refresh_rows(HWND h)
 /* 预设行浏览: 选目录并定位主程序;自定义行: 直接选 exe 文件 */
 static void browse_row(int row)
 {
-    g_activeRow = row;
     if (row >= preset_count()) {
         wchar_t file[MAX_PATH] = L"";
         OPENFILENAMEW ofn;
@@ -561,7 +558,6 @@ static void install_row(int row)
     int tidx;
     DWORD attrs;
 
-    g_activeRow = row;
     if (!row_to_name(row, name, 64)) return;
     if (is_native_row(row)) { repair_row(row); return; }   /* 原生 CLI: 修复而非安装 */
     GetWindowTextW(g_edit[row], path, MAX_PATH);
@@ -614,7 +610,6 @@ static void uninstall_row(int row)
 {
     wchar_t name[64], buf[1024];
 
-    g_activeRow = row;
     if (!row_to_name(row, name, 64)) return;
     if (is_native_row(row)) {
         SetWindowTextW(g_hStatus, L"原生实现,openin 无法卸载。");
@@ -636,7 +631,6 @@ static void test_row(int row)
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
 
-    g_activeRow = row;
     if (!row_to_name(row, name, 64)) return;
     if (!target_installed(name, g_installDir)) {
         SetWindowTextW(g_hStatus, L"未安装,请先点「安装」再测试。");
@@ -686,7 +680,6 @@ static void remove_custom_row(int row)
 {
     wchar_t name[64], buf[256];
 
-    g_activeRow = row;
     if (!row_to_name(row, name, 64)) return;
     remove_target_entry(name);
     _snwprintf_s(buf, 256, 255, L"已移除自定义目标 \"%s\"(已安装的命令不受影响)。", name);
@@ -840,22 +833,8 @@ static int add_custom_dialog(HWND parent)
 static void show_adv_menu(HWND h)
 {
     HMENU m = CreatePopupMenu();
-    wchar_t label[128];
     RECT rc;
 
-    if (g_activeRow >= 0 && g_activeRow < g_rowCount) {
-        wchar_t nm[64];
-        if (row_to_name(g_activeRow, nm, 64))
-            _snwprintf_s(label, 128, 127, L"卸载 %s", nm);
-        else
-            wcscpy_s(label, 128, L"卸载");
-    } else {
-        wcscpy_s(label, 128, L"卸载(未选择)");
-    }
-    /* 原生 CLI(如 claude): openin 无法卸载原生实现,置灰 */
-    AppendMenuW(m, MF_STRING | ((g_activeRow >= 0 && !is_native_row(g_activeRow)) ? MF_ENABLED : MF_GRAYED),
-                IDM_UNINSTALL, label);
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_ADD, L"添加自定义…");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_ABOUT, L"关于");
@@ -997,10 +976,6 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         case IDC_ADV: show_adv_menu(h); return 0;
         case IDM_ADD:
             if (add_custom_dialog(h)) refresh_rows(h);
-            return 0;
-        case IDM_UNINSTALL:
-            if (g_activeRow >= 0) uninstall_row(g_activeRow);
-            else SetWindowTextW(g_hStatus, L"请先在某一行点击浏览或安装。");
             return 0;
         case IDM_ABOUT:
             MessageBoxW(h, L"openin — 通用「打开到应用」启动器安装器\n\n"
