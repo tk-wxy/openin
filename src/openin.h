@@ -30,6 +30,7 @@ typedef struct {
     int native;              /* 1 = 原生地址栏 CLI(如 claude): openin 不创建/不卸载其命令,安装按钮改为「修复」 */
     const wchar_t *args;     /* 固定参数(NULL = 无): 插在目标与用户参数之间,如 dsh → npm exec ... --call "dsh web" */
     const wchar_t *url;      /* Web 工具 URL(NULL = 无): launcher 静默后台启动 server 后自动用默认浏览器打开该 URL */
+    int appPaths;            /* 1 = 需写 App Paths 注册表(解决 npm 裸文件拦截,如 codex);0 = 纯 PATH(如 dsh/vscode) */
 } Preset;
 
 extern const Preset PRESETS[];

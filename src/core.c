@@ -1071,20 +1071,27 @@ int install_target(const wchar_t *name, const wchar_t *codeExe, const wchar_t *a
         if (outAddedPath) *outAddedPath = 1;
     }
 
-    /* CLI 工具: 写入 App Paths 注册表(HKCU),地址栏可用无后缀命令 */
+    /* CLI 工具: 写入 App Paths 注册表(HKCU)——仅对需要它的预设(codex/opencode 有 npm 裸文件拦截);
+       dsh/vscode 纯 PATH 即可,不写注册表(对外影响最小) */
     if (cli && exeBuilt) {
-        wchar_t subKey[300];
-        HKEY hKey;
-        LONG res;
+        int wantsAppPaths = 0;
+        for (int pi = 0; pi < preset_count(); pi++) {
+            if (_wcsicmp(PRESETS[pi].name, name) == 0) { wantsAppPaths = PRESETS[pi].appPaths; break; }
+        }
+        if (wantsAppPaths) {
+            wchar_t subKey[300];
+            HKEY hKey;
+            LONG res;
 
-        emit_step(onStep, L"写 App Paths 注册表(地址栏/终端隔离)…");
-        _snwprintf_s(subKey, 300, 299,
-                     L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%s.exe", name);
-        res = RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
-        if (res == ERROR_SUCCESS) {
-            RegSetValueExW(hKey, L"", 0, REG_SZ, (BYTE*)exePath,
-                           (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
-            RegCloseKey(hKey);
+            emit_step(onStep, L"写 App Paths 注册表(地址栏/终端隔离)…");
+            _snwprintf_s(subKey, 300, 299,
+                         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%s.exe", name);
+            res = RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
+            if (res == ERROR_SUCCESS) {
+                RegSetValueExW(hKey, L"", 0, REG_SZ, (BYTE*)exePath,
+                               (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
+                RegCloseKey(hKey);
+            }
         }
     }
 
@@ -1166,7 +1173,8 @@ int uninstall_target(const wchar_t *name, const wchar_t *installDir,
     if (cmdOwned) { if (DeleteFileW(cmdPath)) any = TRUE; }
     if (exeOwned) { if (DeleteFileW(exePath)) any = TRUE; }
 
-    /* 清理 App Paths 注册表(CLI 目标,失败忽略) */
+    /* 清理 App Paths 注册表(CLI 目标,失败忽略)——无条件删,幂等:新安装未写则删不存在的 key 无害,
+       旧版安装或 codex 写过则确保清理,不留外部痕迹 */
     emit_step(onStep, L"清理 App Paths 注册表…");
     _snwprintf_s(subKey, 300, 299,
                  L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%s.exe", name);
@@ -1219,30 +1227,31 @@ int uninstall_target(const wchar_t *name, const wchar_t *installDir,
 
 /* ---------- 预设模板 ---------- */
 const Preset PRESETS[] = {
-    { L"vscode",   L"Code.exe",          L"VS Code",         0, 0, NULL, NULL },
-    { L"idea",     L"idea64.exe",        L"IntelliJ IDEA",   0, 0, NULL, NULL },
-    { L"cursor",   L"Cursor.exe",        L"Cursor",          0, 0, NULL, NULL },
-    { L"claude",   L"claude.exe",        L"Claude Code",     1, 1, NULL, NULL },
-    { L"codex",    L"codex.cmd",         L"Codex",           1, 0, NULL, NULL },
-    { L"opencode", L"opencode.cmd",      L"OpenCode",        1, 0, NULL, NULL },
+    { L"vscode",   L"Code.exe",          L"VS Code",         0, 0, NULL, NULL, 0 },
+    { L"idea",     L"idea64.exe",        L"IntelliJ IDEA",   0, 0, NULL, NULL, 0 },
+    { L"cursor",   L"Cursor.exe",        L"Cursor",          0, 0, NULL, NULL, 0 },
+    { L"claude",   L"claude.exe",        L"Claude Code",     1, 1, NULL, NULL, 0 },
+    { L"codex",    L"codex.cmd",         L"Codex",           1, 0, NULL, NULL, 1 },
+    { L"opencode", L"opencode.cmd",      L"OpenCode",        1, 0, NULL, NULL, 1 },
     /* dsh: 用 npm exec 的 --call 表单规避 npx 直接跑 bin 的 Windows 缺陷;
        固定参数让 launcher 以「当前文件夹」为 cwd 启动 Harness Web UI;
-       url 让 launcher 静默后台启动 server 后自动打开浏览器(地址栏不闪窗口) */
+       url 让 launcher 静默后台启动 server 后自动打开浏览器(地址栏不闪窗口);
+       appPaths=0: 纯 PATH 即可(无 npm 裸文件冲突),不写 App Paths 注册表(对外影响最小) */
     { L"dsh",      L"npm.cmd",           L"DeepSeek Harness", 1, 0,
       L"exec --yes --package=@deepseek-ai/dsh --call \"dsh web\"",
-      L"http://127.0.0.1:3080" },
-    { L"pycharm",  L"pycharm64.exe",     L"PyCharm",         0, 0, NULL, NULL },
-    { L"webstorm", L"webstorm64.exe",    L"WebStorm",        0, 0, NULL, NULL },
-    { L"goland",   L"goland64.exe",      L"GoLand",          0, 0, NULL, NULL },
-    { L"rider",    L"rider64.exe",       L"Rider",           0, 0, NULL, NULL },
-    { L"datagrip", L"datagrip64.exe",    L"DataGrip",        0, 0, NULL, NULL },
-    { L"clion",    L"clion64.exe",       L"CLion",           0, 0, NULL, NULL },
-    { L"rustrover",L"rustrover64.exe",   L"RustRover",       0, 0, NULL, NULL },
-    { L"fleet",    L"Fleet.exe",         L"JetBrains Fleet", 0, 0, NULL, NULL },
-    { L"sublime",  L"sublime_text.exe",  L"Sublime Text",    0, 0, NULL, NULL },
-    { L"zed",      L"zed.exe",           L"Zed Editor",      0, 0, NULL, NULL },
-    { L"neovide",  L"neovide.exe",       L"Neovide",         0, 0, NULL, NULL },
-    { L"windsurf", L"Windsurf.exe",      L"Windsurf",        0, 0, NULL, NULL },
+      L"http://127.0.0.1:3080", 0 },
+    { L"pycharm",  L"pycharm64.exe",     L"PyCharm",         0, 0, NULL, NULL, 0 },
+    { L"webstorm", L"webstorm64.exe",    L"WebStorm",        0, 0, NULL, NULL, 0 },
+    { L"goland",   L"goland64.exe",      L"GoLand",          0, 0, NULL, NULL, 0 },
+    { L"rider",    L"rider64.exe",       L"Rider",           0, 0, NULL, NULL, 0 },
+    { L"datagrip", L"datagrip64.exe",    L"DataGrip",        0, 0, NULL, NULL, 0 },
+    { L"clion",    L"clion64.exe",       L"CLion",           0, 0, NULL, NULL, 0 },
+    { L"rustrover",L"rustrover64.exe",   L"RustRover",       0, 0, NULL, NULL, 0 },
+    { L"fleet",    L"Fleet.exe",         L"JetBrains Fleet", 0, 0, NULL, NULL, 0 },
+    { L"sublime",  L"sublime_text.exe",  L"Sublime Text",    0, 0, NULL, NULL, 0 },
+    { L"zed",      L"zed.exe",           L"Zed Editor",      0, 0, NULL, NULL, 0 },
+    { L"neovide",  L"neovide.exe",       L"Neovide",         0, 0, NULL, NULL, 0 },
+    { L"windsurf", L"Windsurf.exe",      L"Windsurf",        0, 0, NULL, NULL, 0 },
 };
 
 int preset_count(void) { return (int)(sizeof(PRESETS) / sizeof(PRESETS[0])); }
