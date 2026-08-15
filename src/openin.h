@@ -28,6 +28,8 @@ typedef struct {
     const wchar_t *display;  /* 界面显示名 */
     int cli;                 /* 1 = 命令行工具: 继承 cwd,不传目录参数 */
     int native;              /* 1 = 原生地址栏 CLI(如 claude): openin 不创建/不卸载其命令,安装按钮改为「修复」 */
+    const wchar_t *args;     /* 固定参数(NULL = 无): 插在目标与用户参数之间,如 dsh → npm exec ... --call "dsh web" */
+    const wchar_t *url;      /* Web 工具 URL(NULL = 无): launcher 静默后台启动 server 后自动用默认浏览器打开该 URL */
 } Preset;
 
 extern const Preset PRESETS[];
@@ -60,8 +62,8 @@ void remove_target_entry(const wchar_t *name);
 BOOL target_installed(const wchar_t *name, const wchar_t *installDir);
 int  list_installed(const wchar_t *installDir, wchar_t *out, size_t outSz);
 typedef void (*StepCb)(const wchar_t *msg);   /* 操作步骤回调: 安装/卸载时逐条通报,可为 NULL */
-int  install_target(const wchar_t *name, const wchar_t *codeExe, int cli,
-                    const wchar_t *installDir,
+int  install_target(const wchar_t *name, const wchar_t *codeExe, const wchar_t *args,
+                    const wchar_t *url, int cli, const wchar_t *installDir,
                     wchar_t *outSummary, size_t sumSz, int *outAddedPath, StepCb onStep);
 int  uninstall_target(const wchar_t *name, const wchar_t *installDir,
                       wchar_t *outSummary, size_t sumSz, StepCb onStep);

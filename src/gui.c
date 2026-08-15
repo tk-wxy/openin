@@ -589,7 +589,9 @@ static void install_row(int row)
             tidx = find_target(name);
             if (tidx >= 0) cli = g_targets[tidx].cli;
         }
-        if (install_target(name, codeExe, cli, g_installDir, buf, 4096, NULL, install_step_cb) == 0) {
+        if (install_target(name, codeExe, (row < preset_count()) ? PRESETS[row].args : L"",
+                           (row < preset_count()) ? PRESETS[row].url : NULL,
+                           cli, g_installDir, buf, 4096, NULL, install_step_cb) == 0) {
             tidx = find_target(name);
             if (tidx >= 0) {
                 wcscpy_s(g_targets[tidx].exePath, MAX_PATH, codeExe);

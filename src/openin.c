@@ -139,7 +139,7 @@ int wmain(int argc, wchar_t *argv[])
             if (target_installed(PRESETS[i].name, dir)) { skipped++; continue; }
             found[0] = L'\0';
             if (!detect_app(PRESETS[i].exeName, found, MAX_PATH)) { notFound++; continue; }
-            if (install_target(PRESETS[i].name, found, PRESETS[i].cli, dir, buf, 4096, NULL, NULL) == 0)
+            if (install_target(PRESETS[i].name, found, PRESETS[i].args, PRESETS[i].url, PRESETS[i].cli, dir, buf, 4096, NULL, NULL) == 0)
                 added++;
             else
                 failed++;
@@ -177,10 +177,12 @@ int wmain(int argc, wchar_t *argv[])
     pick_target_dir(targetOverride, installDir, MAX_PATH);
 
     {
+        const wchar_t *args = L"";
+        const wchar_t *url = NULL;
         int cli = 0;
         for (i = 0; i < preset_count(); i++)
-            if (_wcsicmp(PRESETS[i].name, name) == 0) { cli = PRESETS[i].cli; break; }
-        rc = install_target(name, codeExe, cli, installDir, buf, 4096, NULL, NULL);
+            if (_wcsicmp(PRESETS[i].name, name) == 0) { cli = PRESETS[i].cli; args = PRESETS[i].args; url = PRESETS[i].url; break; }
+        rc = install_target(name, codeExe, args, url, cli, installDir, buf, 4096, NULL, NULL);
     }
     if (rc == 0) {
         /* 仅在会话内存记录目标,不落盘 */
