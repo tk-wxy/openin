@@ -19,6 +19,10 @@
 #include "openin.h"
 
 static int g_scrollY = 0;
+static float g_scrollPending = 0.0f;  /* 高频滚动(触控板)增量累积,定时器合并后一次应用 */
+#define IDT_SCROLL 2001               /* 滚动合并定时器 id */
+#define SCROLL_MS 15                  /* 合并窗口:窗口内多次滚动消息只重排一次(~60Hz) */
+static int g_fullLayout = 1;          /* 强制全量:初始 / 尺寸 / DPI / 重建行时置 1;滚动帧为 0 */
 
 enum {
     IDC_REDETECT = 102,
@@ -40,6 +44,7 @@ enum {
 };
 
 static HWND g_hMain, g_hHeader, g_hRedetect, g_hAdv, g_hDeepScan, g_hStatus, g_hList;
+static HWND g_hCanvas = NULL;   /* 可滚动画布:行控件的父,滚动只移动它(整条带重绘) */
 static HWND *g_name, *g_edit, *g_browse, *g_install, *g_remove, *g_test, *g_uninstall, *g_rowStatus;
 static int g_rowCount = 0;
 static const wchar_t *g_winClass = L"openin_main";
@@ -189,6 +194,7 @@ static void destroy_rows(void)
     }
     g_name = g_edit = g_browse = g_install = g_remove = g_test = g_uninstall = g_rowStatus = NULL;
     g_rowCount = 0;
+    if (g_hCanvas) { DestroyWindow(g_hCanvas); g_hCanvas = NULL; }   /* 画布销毁连带全部行子控件 */
 }
 
 static void build_rows(HWND h)
@@ -199,6 +205,11 @@ static void build_rows(HWND h)
     destroy_rows();
     n = total_rows();
     g_rowCount = n;
+    /* 可滚动画布:行控件真正的父(在面板 h 内)。滚动时只移动画布一个窗口,
+     * 行控件相对画布位置不变,免逐行重排——面板裁剪画布,露出的条带由画布
+     * 背景(BTNFACE)擦净。复用 list 类以继承 WM_COMMAND 转发。 */
+    g_hCanvas = CreateWindowExW(0, g_listClass, L"",
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, 100, 100, h, NULL, hi, NULL);
     if (n <= 0) return;
     g_name = (HWND *)calloc((size_t)n, sizeof(HWND));
     g_edit = (HWND *)calloc((size_t)n, sizeof(HWND));
@@ -223,29 +234,29 @@ static void build_rows(HWND h)
                          nm, (k >= 0 && g_targets[k].cli) ? L"·CLI" : L"");
         }
         g_name[i] = CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE,
-            0, 0, 120, 20, h, NULL, hi, NULL);
+            0, 0, 120, 20, g_hCanvas, NULL, hi, NULL);
         g_edit[i] = CreateWindowExW(0, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, 0, 0, 100, 22, h,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, 0, 0, 100, 22, g_hCanvas,
             (HMENU)(INT_PTR)(IDC_ROW_EDIT + i), hi, NULL);
         if (g_edit[i]) SetWindowTheme(g_edit[i], L"Explorer", NULL);  /* 现代扁平边框(替代经典 3D 凹陷) */
         g_browse[i] = CreateWindowExW(0, L"BUTTON", L"浏览",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 60, 24, h,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 60, 24, g_hCanvas,
             (HMENU)(INT_PTR)(IDC_ROW_BROWSE + i), hi, NULL);
         g_install[i] = CreateWindowExW(0, L"BUTTON", L"安装",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 90, 26, h,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 90, 26, g_hCanvas,
             (HMENU)(INT_PTR)(IDC_ROW_INSTALL + i), hi, NULL);
         g_test[i] = CreateWindowExW(0, L"BUTTON", L"测试",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 56, 26, h,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 56, 26, g_hCanvas,
             (HMENU)(INT_PTR)(IDC_ROW_TEST + i), hi, NULL);
         g_uninstall[i] = CreateWindowExW(0, L"BUTTON", L"卸载",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 56, 26, h,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 56, 26, g_hCanvas,
             (HMENU)(INT_PTR)(IDC_ROW_UNINSTALL + i), hi, NULL);
         if (i >= preset_count())   /* 自定义行带「移除」 */
             g_remove[i] = CreateWindowExW(0, L"BUTTON", L"移除",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 50, 26, h,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 50, 26, g_hCanvas,
                 (HMENU)(INT_PTR)(IDC_ROW_REMOVE + i), hi, NULL);
         g_rowStatus[i] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
-            0, 0, 200, 18, h, NULL, hi, NULL);
+            0, 0, 200, 18, g_hCanvas, NULL, hi, NULL);
     }
 }
 
@@ -320,7 +331,7 @@ static void layout_controls(HWND h)
     int listTop = SCALE(68);
     int w, clientH, viewportH, yBottom, i;
     int rightEdge, removeX, uninstallX, testX, installX, browseX, editX, editW;
-    int first, last;
+    int contentH, canvasH, y;
     HDWP hdwp;
 
     update_scrollbar(h);   /* 先按范围钳制 g_scrollY, 供本次布局使用 */
@@ -338,22 +349,15 @@ static void layout_controls(HWND h)
     editW = browseX - gap - editX;
     yBottom = clientH - m - btnH;
     viewportH = (yBottom - gap) - listTop;   /* 滚动面板可视高度 */
+    contentH = g_rowCount * rowH + SCALE(8); /* 全部行内容高度 */
+    canvasH = (contentH > viewportH ? contentH : viewportH); /* 画布至少盖满视口 */
 
-    /* 可见行范围(含上/下一行余量,跨界行也参与重排) */
-    first = (g_scrollY - rowH) / rowH;
-    if (first > 0) first--;
-    if (first < 0) first = 0;
-    last = (g_scrollY + viewportH + rowH) / rowH;
-    if (last >= g_rowCount) last = g_rowCount - 1;
-    if (first > last) first = last;   /* 内容不足一屏时 */
-
-    /* 批量移动一次成型: 避免每行 MoveWindow 各自触发重绘,滚动大幅提速。
-     * 注意: 同一批次不能同时移动父窗口和它的子控件(EndDeferWindowPos 会静默不生效),
-     * 因此主窗口子级与列表面板内的行控件分两个批次。 */
+    /* 批次 1: 主窗口子级——顶部按钮行 + 标题 + 滚动面板 + 状态栏(固定)。
+     * 批次间互不为父子, 哪批先后都行(独立 EndDefer)。 */
     hdwp = BeginDeferWindowPos(8);
     if (hdwp) {
         const UINT df = SWP_NOZORDER | SWP_NOACTIVATE;
-        /* 三段式:顶部菜单栏行(重新检测/高级)+ 标题固定,中部滚动面板裁剪行控件,底部状态固定 */
+        /* 三段式:顶部菜单栏行(重新检测/高级)+ 标题固定,中部滚动面板裁剪画布,底部状态固定 */
         if (g_hRedetect)
             DeferWindowPos(hdwp, g_hRedetect, NULL, m, SCALE(6), SCALE(96), btnH, df);
         if (g_hDeepScan)
@@ -369,32 +373,47 @@ static void layout_controls(HWND h)
         EndDeferWindowPos(hdwp);
     }
 
-    hdwp = BeginDeferWindowPos(g_rowCount * 8 + 8);
-    if (hdwp) {
-        const UINT df = SWP_NOZORDER | SWP_NOACTIVATE;
-        for (i = 0; i < g_rowCount; i++) {
-            /* 可视行按滚动定位; 屏外行统一移到固定屏外位置——否则大幅跳转(如拖到底)
-             * 后, 未重排的行会残留旧位置落入可视区。屏外行位置不变, Defer 为廉价空操作 */
-            int y = (i >= first && i <= last) ? SCALE(4) + i * rowH - g_scrollY : -4 * rowH;
-            if (g_name[i])
-                DeferWindowPos(hdwp, g_name[i], NULL, m, y + (lineH - SCALE(20)) / 2, nameW, SCALE(20), df);
-            if (g_edit[i])
-                DeferWindowPos(hdwp, g_edit[i], NULL, editX, y, editW, lineH, df);
-            if (g_browse[i])
-                DeferWindowPos(hdwp, g_browse[i], NULL, browseX, y, browseW, btnH, df);
-            if (g_install[i])
-                DeferWindowPos(hdwp, g_install[i], NULL, installX, y, installW, btnH, df);
-            if (g_test[i])
-                DeferWindowPos(hdwp, g_test[i], NULL, testX, y, testW, btnH, df);
-            if (g_uninstall[i])
-                DeferWindowPos(hdwp, g_uninstall[i], NULL, uninstallX, y, uninstallW, btnH, df);
-            if (g_remove[i])
-                DeferWindowPos(hdwp, g_remove[i], NULL, removeX, y, removeW, btnH, df);
-            if (g_rowStatus[i])
-                DeferWindowPos(hdwp, g_rowStatus[i], NULL, editX, y + lineH + SCALE(4), editW, SCALE(18), df);
+    /* 批次 2: 可滚动画布(面板子窗口)——滚动帧只需移动它一个窗口, 行控件相对画布
+     * 位置不变, 免逐行 SetWindowPos; 面板按 WS_CLIPCHILDREN 裁剪画布, 滚动露出的
+     * 上下条带由画布背景(BTNFACE)擦净。父(画布)+子(行)不可同批, 故独立一次 End。 */
+    if (g_hCanvas) {
+        hdwp = BeginDeferWindowPos(1);
+        if (hdwp) {
+            DeferWindowPos(hdwp, g_hCanvas, NULL, 0, -g_scrollY, w, canvasH,
+                           SWP_NOZORDER | SWP_NOACTIVATE);
+            EndDeferWindowPos(hdwp);
         }
-        EndDeferWindowPos(hdwp);
     }
+
+    /* 批次 3: 行控件(画布子级)——仅在尺寸/DPI/重建行等全量帧定一次固定坐标;
+     * 滚动帧整段跳过, 行跟画布整体平移, 不重排不重绘。 */
+    if (g_fullLayout && g_hCanvas) {
+        hdwp = BeginDeferWindowPos(g_rowCount * 8 + 8);
+        if (hdwp) {
+            const UINT df = SWP_NOZORDER | SWP_NOACTIVATE;
+            for (i = 0; i < g_rowCount; i++) {
+                y = SCALE(4) + i * rowH;   /* 相对画布顶部的固定位置 */
+                if (g_name[i])
+                    DeferWindowPos(hdwp, g_name[i], NULL, m, y + (lineH - SCALE(20)) / 2, nameW, SCALE(20), df);
+                if (g_edit[i])
+                    DeferWindowPos(hdwp, g_edit[i], NULL, editX, y, editW, lineH, df);
+                if (g_browse[i])
+                    DeferWindowPos(hdwp, g_browse[i], NULL, browseX, y, browseW, btnH, df);
+                if (g_install[i])
+                    DeferWindowPos(hdwp, g_install[i], NULL, installX, y, installW, btnH, df);
+                if (g_test[i])
+                    DeferWindowPos(hdwp, g_test[i], NULL, testX, y, testW, btnH, df);
+                if (g_uninstall[i])
+                    DeferWindowPos(hdwp, g_uninstall[i], NULL, uninstallX, y, uninstallW, btnH, df);
+                if (g_remove[i])
+                    DeferWindowPos(hdwp, g_remove[i], NULL, removeX, y, removeW, btnH, df);
+                if (g_rowStatus[i])
+                    DeferWindowPos(hdwp, g_rowStatus[i], NULL, editX, y + lineH + SCALE(4), editW, SCALE(18), df);
+            }
+            EndDeferWindowPos(hdwp);
+        }
+    }
+    g_fullLayout = 0;   /* 本帧全量标志消费完毕, 下一帧(滚动)走纯画布平移 */
 }
 
 /* ---------- 后台自动检测 ---------- */
@@ -473,6 +492,7 @@ static void start_deep_scan(HWND h)
 static void refresh_rows(HWND h)
 {
     int i;
+    g_fullLayout = 1;      /* 行控件整体重建,本帧强制全量重排 */
     build_rows(g_hList);   /* 行控件挂在滚动面板内,由面板裁剪、隔离底栏 */
     layout_controls(h);
     for (i = 0; i < g_rowCount; i++)
@@ -870,6 +890,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         return 0;
     }
     case WM_SIZE:
+        g_fullLayout = 1;   /* 尺寸变化, 所有行高宽都要重设 */
         layout_controls(h);
         return 0;
     case WM_VSCROLL: {
@@ -897,21 +918,38 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
     }
     case WM_MOUSEWHEEL: {
         int zDelta = GET_WHEEL_DELTA_WPARAM(w);
-        SCROLLINFO si;
-        ZeroMemory(&si, sizeof(si));
-        si.cbSize = sizeof(si);
-        si.fMask = SIF_POS;
-        GetScrollInfo(h, SB_VERT, &si);
-        int oldPos = si.nPos;
-        si.nPos -= (zDelta / WHEEL_DELTA) * 40;
-        SetScrollInfo(h, SB_VERT, &si, TRUE);
-        GetScrollInfo(h, SB_VERT, &si);
-        if (si.nPos != oldPos) {
-            g_scrollY = si.nPos;
-            layout_controls(h);
-        }
+        /* 触控板/表面滚轮以 60~125Hz 发连续小步进滚动消息,若每条消息都全量重排
+         * 会掉帧(鼠标滚轮是离散咔哒、低频,所以基本正常)。这里只累加增量并
+         * 重置 15ms 一次性定时器,到点合并应用一次(高频 N 合 1);
+         * 小步进(zDelta<120)留在浮点余数里继续累积,不丢滚轮行程。 */
+        g_scrollPending += (float)zDelta / (float)WHEEL_DELTA * 40.0f;
+        if (g_scrollPending != 0.0f)
+            SetTimer(h, IDT_SCROLL, SCROLL_MS, NULL);
         return 0;
     }
+    case WM_TIMER:
+        if (w == IDT_SCROLL) {
+            KillTimer(h, IDT_SCROLL);
+            int delta = (int)g_scrollPending;   /* 向零截断,余数保留继续累积 */
+            if (delta != 0) {
+                SCROLLINFO si;
+                g_scrollPending -= (float)delta;
+                ZeroMemory(&si, sizeof(si));
+                si.cbSize = sizeof(si);
+                si.fMask = SIF_POS;
+                GetScrollInfo(h, SB_VERT, &si);
+                int oldPos = si.nPos;
+                si.nPos -= delta;
+                SetScrollInfo(h, SB_VERT, &si, TRUE);
+                GetScrollInfo(h, SB_VERT, &si);
+                if (si.nPos != oldPos) {
+                    g_scrollY = si.nPos;
+                    layout_controls(h);
+                }
+            }
+            return 0;
+        }
+        break;
     case WM_DPICHANGED: {
         RECT *prc = (RECT *)l;   /* 系统建议的新窗口矩形 */
         create_ui_font(h);       /* 按新 DPI 重建字体并更新 g_dpi */
@@ -920,6 +958,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             SetWindowPos(h, NULL, prc->left, prc->top,
                          prc->right - prc->left, prc->bottom - prc->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+        g_fullLayout = 1;   /* DPI 变化, 控件尺寸与行距全变 */
         layout_controls(h);
         return 0;
     }
@@ -985,6 +1024,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         return 0;
     case WM_DESTROY:
+        KillTimer(h, IDT_SCROLL);
         InterlockedExchange(&g_detectStop, 1);
         if (g_detectThread) {
             WaitForSingleObject(g_detectThread, 3000);
@@ -998,6 +1038,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             g_deepThread = NULL;
         }
         destroy_rows();
+        g_scrollPending = 0.0f;
         if (g_font) { DeleteObject(g_font); g_font = NULL; }
         PostQuitMessage(0);
         return 0;
