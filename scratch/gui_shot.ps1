@@ -14,7 +14,8 @@ public class GShot {
   [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, CW cb, IntPtr l);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
   public struct RECT { public int L,T,R,B; }
@@ -25,6 +26,7 @@ public class GShot {
     EnumChildWindows(panel,(h,l)=>{ if(canvas==IntPtr.Zero && Cls(h)=="openin_list") canvas=h; return true; },IntPtr.Zero);
     return "panelVis="+IsWindowVisible(panel)+" canvasVis="+IsWindowVisible(canvas);
   }
+  public static void MakeDpiAware(){ SetProcessDPIAware(); }
   public static void Shot(IntPtr h, string path){
     RECT r; GetWindowRect(h,out r);
     int w=r.R-r.L, ht=r.B-r.T;
@@ -61,6 +63,7 @@ public class GShot {
   }
 }
 '@
+[void][GShot]::MakeDpiAware()
 $p = Start-Process -FilePath "$PSScriptRoot\..\openin.exe" -PassThru
 Start-Sleep 4
 $proc = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
