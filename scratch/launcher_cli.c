@@ -160,6 +160,25 @@ static wchar_t *dsh_rpc(const wchar_t *method, const wchar_t *payloadJson)
     return out;
 }
 
+/* The TCP listener can come up before dsh has finished mounting its API. */
+static int dsh_rpc_succeeded(const wchar_t *response)
+{
+    return response && wcsstr(response, L"\"ok\":true") != NULL;
+}
+
+/* Retry bounded RPCs during dsh startup instead of silently losing registration. */
+static wchar_t *dsh_rpc_retry(const wchar_t *method, const wchar_t *payloadJson)
+{
+    DWORD start = GetTickCount();
+    for (;;) {
+        wchar_t *response = dsh_rpc(method, payloadJson);
+        if (dsh_rpc_succeeded(response)) return response;
+        free(response);
+        if ((DWORD)(GetTickCount() - start) >= 12000) return NULL;
+        Sleep(250);
+    }
+}
+
 /* 从 npm.cmd 路径推导 node.exe(同目录) */
 static void derive_node_exe(const wchar_t *npmCmd, wchar_t *out, size_t cap)
 {
@@ -199,6 +218,7 @@ static int find_dsh_binjs(wchar_t *out, size_t cap)
 int wmain(int argc, wchar_t *argv[])
 {
     wchar_t cmdline[2048];
+    wchar_t open_url[1024];
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     int webMode = (g_web_url[0] != L'\0');
@@ -210,6 +230,7 @@ int wmain(int argc, wchar_t *argv[])
     ZeroMemory(&pi, sizeof(pi));
 
     if (webMode) {
+        wcscpy_s(open_url, 1024, g_web_url);
         /* Web 工具: 首次启动时用可见 cmd 窗口跑 server——地址栏场景 explorer 会为 cmd 分配
          * 新控制台窗口(可看 npm/dsh 运行日志,Ctrl+C 或关窗即停止),终端场景则继承当前控制台;
          * 端口就绪后自动开浏览器;server 已在跑则跳过启动,只开浏览器 */
@@ -250,8 +271,8 @@ int wmain(int argc, wchar_t *argv[])
             if (port > 0)
                 wait_port_ready(port, 8000);
         }
-        /* 按文件夹打开(2026-08-15): 把当前目录登记为工作区并建一个最新会话,
-         * UI 初始选择(最近会话所在的工作区)随之落到当前目录。
+        /* 按文件夹打开: 把当前目录登记为工作区并建一个最新会话;
+         * dsh-session-link Client 插件通过 URL deep-link 选中该 session。
          * 仅对提供 workspace API 的 Web 工具(如 dsh)有效;任一调用失败都降级为直接开浏览器。 */
         {
             wchar_t cwd[MAX_PATH], esc[2 * MAX_PATH + 8], payload[2 * MAX_PATH + 64];
@@ -266,25 +287,35 @@ int wmain(int argc, wchar_t *argv[])
                 esc[j] = L'\0';
                 _snwprintf_s(payload, 2 * MAX_PATH + 64, 2 * MAX_PATH + 63,
                              L"{\"path\":\"%s\"}", esc);
-                resp = dsh_rpc(L"workspace.create", payload);
+                resp = dsh_rpc_retry(L"workspace.create", payload);
                 wsId = resp ? wcsstr(resp, L"\"workspaceId\":\"") : NULL;
                 if (wsId) {
                     wchar_t id[64];
+                    wchar_t sessionId[64];
                     int k;
                     wsId += 15;   /* 跳过 "workspaceId":" */
                     for (k = 0; k < 63 && wsId[k] && wsId[k] != L'"'; k++) id[k] = wsId[k];
                     id[k] = L'\0';
                     if (k > 0) {
+                        _snwprintf_s(sessionId, 64, 63, L"openin-%lu-%lu",
+                                     (unsigned long)GetTickCount(),
+                                     (unsigned long)GetCurrentProcessId());
                         _snwprintf_s(payload, 2 * MAX_PATH + 64, 2 * MAX_PATH + 63,
-                                     L"{\"workspaceId\":\"%s\"}", id);
+                                     L"{\"workspaceId\":\"%s\",\"sessionId\":\"%s\"}",
+                                     id, sessionId);
                         free(resp);
-                        resp = dsh_rpc(L"session.create", payload);
+                        resp = dsh_rpc_retry(L"session.create", payload);
+                        if (resp) {
+                            const wchar_t *sep = wcschr(g_web_url, L'?') ? L"&" : L"?";
+                            _snwprintf_s(open_url, 1024, 1023,
+                                         L"%s%sopeninSession=%s", g_web_url, sep, sessionId);
+                        }
                     }
                 }
                 free(resp);
             }
         }
-        ShellExecuteW(NULL, L"open", g_web_url, NULL, NULL, SW_SHOWNORMAL);
+        ShellExecuteW(NULL, L"open", open_url, NULL, NULL, SW_SHOWNORMAL);
         return 0;
     }
 
