@@ -13,6 +13,14 @@
 
 #include <windows.h>
 
+/* ---------- 版本信息(单一事实源) ----------
+ * ⚠️ 改版本号必须三处同步: ①本宏 ②src/openin.rc 的 FILEVERSION/PRODUCTVERSION 与
+ * StringFileInfo ③src/openin.manifest 的 assemblyIdentity version。 */
+#define OPENIN_VERSION_MAJOR  2
+#define OPENIN_VERSION_MINOR  1
+#define OPENIN_VERSION_PATCH  0
+#define OPENIN_VERSION_STR    "2.1.0"
+
 /* ---------- 共享类型与全局(core.c 持有) ---------- */
 #define MAX_TARGETS 64
 

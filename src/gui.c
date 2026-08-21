@@ -1428,8 +1428,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
             if (add_custom_dialog(h)) refresh_rows(h);
             return 0;
         case IDM_ABOUT:
-            MessageBoxW(h, L"openin — 通用「打开到应用」启动器安装器\n\n"
-                          L"把应用注入地址栏: 输入命令,以当前文件夹为参数打开。",
+            MessageBoxW(h, L"openin v" OPENIN_VERSION_STR L"\n"
+                          L"通用「打开到应用」启动器安装器\n\n"
+                          L"把应用注入地址栏: 输入命令,以当前文件夹为参数打开。\n"
+                          L"便携单 exe,无状态,卸载后可逆还原。",
                         L"关于 openin", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
@@ -1487,7 +1489,7 @@ int gui_main(void)
     wc.lpszClassName = g_listClass;
     RegisterClassW(&wc);
 
-    hwnd = CreateWindowExW(0, g_winClass, L"openin — 打开到应用",
+    hwnd = CreateWindowExW(0, g_winClass, L"openin v" OPENIN_VERSION_STR L" — 打开到应用",
                            WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_CLIPCHILDREN,
                            CW_USEDEFAULT, CW_USEDEFAULT, SCALE(980), SCALE(680),
                            NULL, NULL, wc.hInstance, NULL);

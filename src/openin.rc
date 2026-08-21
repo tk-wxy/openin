@@ -1,1 +1,32 @@
+/* 源码为 UTF-8(让 windres 按 UTF-8 而非系统 GBK 解码中文,避免版本信息乱码) */
+#pragma code_page(65001)
+
 1 24 "openin.manifest"
+
+/* VERSIONINFO — exe 文件属性里的标准版本信息。
+ * ⚠️ 与 src/openin.h 的 OPENIN_VERSION_* 及 openin.manifest 的 assemblyIdentity
+ *    version 保持同步(改版本号三处一起改)。 */
+1 VERSIONINFO
+FILEVERSION    2,1,0,0
+PRODUCTVERSION 2,1,0,0
+FILEOS 0x00040004L        /* VOS_NT_WINDOWS32 */
+FILETYPE 0x1              /* VFT_APP */
+BEGIN
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0804, 1200  /* 简体中文, Unicode */
+  END
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404b0"
+    BEGIN
+      VALUE "CompanyName", "openin"
+      VALUE "FileDescription", "openin — 通用「打开到应用」启动器安装器"
+      VALUE "FileVersion", "2, 1, 0, 0"
+      VALUE "InternalName", "openin"
+      VALUE "OriginalFilename", "openin.exe"
+      VALUE "ProductName", "openin"
+      VALUE "ProductVersion", "2, 1, 0, 0"
+    END
+  END
+END

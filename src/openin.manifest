@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.0.0" name="openin.app"/>
+  <assemblyIdentity version="2.1.0.0" name="openin.app"/>
   <!-- 视觉样式: comctl32 v6(现代主题控件,替代 Win95 旧样式) -->
   <dependency>
     <dependentAssembly>

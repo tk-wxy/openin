@@ -5,6 +5,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Windows%2010+-blue?logo=windows" alt="Platform" />
   <img src="https://img.shields.io/badge/C%20(Win32)-00599C?logo=c&logoColor=white" alt="Language" />
+  <img src="https://img.shields.io/badge/version-2.1.0-blue" alt="Version" />
   <img src="https://img.shields.io/badge/~150%20KB-green" alt="Size" />
   <img src="https://img.shields.io/badge/零依赖-brightgreen" alt="Zero dependencies" />
   <img src="https://img.shields.io/github/license/tk-wxy/openin" alt="License" />
@@ -29,9 +30,10 @@ openin 是一个**一次性注入工具**：它为指定应用生成独立的启
 
 ## 下载
 
-前往 [Releases](https://github.com/tk-wxy/openin/releases) 下载 `openin.exe`。
+前往 [Releases](https://github.com/tk-wxy/openin/releases) 下载 `openin.exe`（当前版本 **v2.1.0**）。
 
 单文件便携程序，双击即用。不需要安装，不需要常驻运行，不需要编译器。
+在 Windows 资源管理器中右键 exe →「属性」→「详细信息」可查看版本信息。
 
 ## 使用
 
